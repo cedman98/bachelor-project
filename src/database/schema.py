@@ -31,3 +31,20 @@ class WindStationMeasurements(SQLModel, table=True):
     average_wind_speed: float
     average_wind_direction: float
     record_date: datetime = Field(index=True)
+
+
+class WindTurbines(SQLModel, table=True):
+    __tablename__ = "wind_turbines"
+
+    unit_mastr_number: str = Field(primary_key=True)
+    last_update_date: datetime | None
+    final_decommission_date: datetime | None
+    gross_power: float | None
+    net_nominal_power: float | None
+    manufacturer: int | None
+    technology: int | None
+    type_designation: str | None
+    hub_height: float
+    rotor_diameter: float
+    longitude: float = Field(index=True)
+    latitude: float = Field(index=True)

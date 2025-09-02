@@ -4,3 +4,10 @@ database:
 dwd:
   weather_stations_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/KL_Tageswerte_Beschreibung_Stationen.txt"
   base_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/10_minutes/wind/"
+marktstammdatenregister:
+  wind_turbines_data_download_url: "https://download.marktstammdatenregister.de/Gesamtdatenexport_20250902_25.1.zip"
+  wind_turbines_data_file_name: "EinheitenWind.xml"
+  wind_turbines_local_path: "data/EinheitenWind.xml"
+  wind_turbines_explanation_download_url: "https://www.marktstammdatenregister.de/MaStRHilfe/files/gesamtdatenexport/Dokumentation%20MaStR%20Gesamtdatenexport.zip"
+  wind_turbines_explanation_file_name: "xsd/EinheitenWind.xsd"
+  wind_turbines_explanation_local_path: "data/EinheitenWind.xsd"
