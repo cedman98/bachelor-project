@@ -2,8 +2,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from sqlmodel import SQLModel, create_engine
 
+import src.database.schema
 
-class DatabaseClass:
+
+class DatabaseService:
     def __init__(self, cfg: OmegaConf):
         self.engine = create_engine(cfg.database.url, echo=cfg.database.echo)
 

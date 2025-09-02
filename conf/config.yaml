@@ -1,7 +1,8 @@
 database:
-  url: ${oc.env:DATABASE_URL,"postgres://neon:npg@localhost:5432/neondb"}
+  url: ${oc.env:DATABASE_URL,"postgresql+psycopg://neon:npg@localhost:5432/neondb"}
   echo: True
 dwd:
+  weather_stations_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/KL_Tageswerte_Beschreibung_Stationen.txt"
   base_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/10_minutes/wind/"
   file_prefix: "10minutenwerte_wind_"
   file_suffix: ".zip"
