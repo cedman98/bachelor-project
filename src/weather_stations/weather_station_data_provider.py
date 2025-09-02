@@ -209,3 +209,22 @@ class WeatherStationDataProvider:
             session.commit()
 
         logger.info(f"Saved {len(weather_stations)} weather stations to database")
+
+    def load_from_database(self, only_relevant: bool = True) -> pd.DataFrame:
+        """
+        Load the weather stations from the database.
+        @param only_relevant: If True, only load the relevant weather stations, (active and in Brandenburg)
+        @return: The weather stations DataFrame.
+        """
+        with Session(self.database_service.engine) as session:
+            query = select(WeatherStations)
+            if only_relevant:
+                query = query.where(WeatherStations.is_active == True).where(
+                    WeatherStations.state == "Brandenburg"
+                )
+            query = query.order_by(WeatherStations.weather_station_id)
+
+            results = session.exec(query).all()
+            df = pd.DataFrame([row.model_dump() for row in results])
+            logger.info(f"Loaded {len(df)} weather stations from database")
+            return df

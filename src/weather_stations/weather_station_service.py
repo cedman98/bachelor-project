@@ -9,6 +9,10 @@ from src.weather_stations.weather_station_data_provider import (
 
 
 class WeatherStationService:
+    """
+    The service offers functions for working with the weather stations.
+    """
+
     cfg: OmegaConf
     database_service: DatabaseService
     data_provider: WeatherStationDataProvider
@@ -28,8 +32,11 @@ class WeatherStationService:
             else WeatherStationDataProvider(cfg, database_service)
         )
 
-    def load_database_with_weather_stations(self):
-
+    def fill_database_with_weather_stations(self):
+        """
+        Fill the database with the weather stations from the DWD.
+        @return: The weather stations DataFrame. The df is also stored in the service.
+        """
         # 1. Loading the weather stations file
         try:
             weather_stations_file = self.data_provider.download_weather_stations_file()
@@ -64,4 +71,13 @@ class WeatherStationService:
 
         self.weather_stations = weather_stations
 
+        return self.weather_stations
+
+    def load_from_database(self, only_relevant: bool = True) -> pd.DataFrame:
+        """
+        Load the weather stations from the database.
+        @param only_relevant: If True, only load the relevant weather stations, (active and in Brandenburg)
+        @return: The weather stations DataFrame.
+        """
+        self.weather_stations = self.data_provider.load_from_database(only_relevant)
         return self.weather_stations
