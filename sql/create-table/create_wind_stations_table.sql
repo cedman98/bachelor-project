@@ -1,0 +1,10 @@
+CREATE TABLE IF NOT EXISTS wind_stations (
+    station_id INTEGER PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    latitude DOUBLE PRECISION NOT NULL,
+    longitude DOUBLE PRECISION NOT NULL,
+    height DOUBLE PRECISION NOT NULL,
+    start_date DATE NOT NULL
+);
+
+
