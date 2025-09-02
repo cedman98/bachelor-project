@@ -1,7 +1,7 @@
-from datetime import date
+from datetime import date, datetime
 from typing import Optional
 
-from sqlalchemy import Column, String
+from sqlalchemy import Column, String, UniqueConstraint
 from sqlmodel import Field, SQLModel
 
 
@@ -17,3 +17,17 @@ class WeatherStations(SQLModel, table=True):
     start_date: date
     end_date: date
     is_active: bool
+
+
+class WindStationMeasurements(SQLModel, table=True):
+    __tablename__ = "wind_station_measurements"
+    __table_args__ = (
+        UniqueConstraint("station_id", "record_date", name="uix_station_date"),
+    )
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    station_id: int = Field(index=True)
+    quality_level: int
+    average_wind_speed: float
+    average_wind_direction: float
+    record_date: datetime = Field(index=True)
