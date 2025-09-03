@@ -26,7 +26,9 @@ class WindStationMeasurements(SQLModel, table=True):
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)
-    station_id: int = Field(index=True)
+    station_id: int = Field(
+        index=True, foreign_key="weather_stations.weather_station_id"
+    )
     quality_level: int
     average_wind_speed: float
     average_wind_direction: float
