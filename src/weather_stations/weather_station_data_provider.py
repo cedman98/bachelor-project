@@ -2,7 +2,8 @@ from loguru import logger
 from omegaconf import OmegaConf
 import pandas as pd
 import requests
-from sqlmodel import Session, select
+from sqlalchemy.orm import Session
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.schema import WeatherStations
@@ -181,34 +182,28 @@ class WeatherStationDataProvider:
         Save the weather stations DataFrame to the database.
         @param df: The weather stations DataFrame.
         """
-        weather_stations = [
-            WeatherStations(**row) for row in df.to_dict(orient="records")
+        table = WeatherStations.__table__
+        allowed_columns = set(table.columns.keys())
+        records = [
+            {k: v for k, v in row.items() if k in allowed_columns}
+            for row in df.to_dict(orient="records")
         ]
 
+        stmt = pg_insert(table).values(records)
+        update_columns = {
+            c.name: stmt.excluded[c.name]
+            for c in table.columns
+            if c.name != "weather_station_id"
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["weather_station_id"], set_=update_columns
+        )
+
         with Session(self.database_service.engine) as session:
-            for weather_station in weather_stations:
-                # check if weather_station already exists
-                remote_model = session.exec(
-                    select(WeatherStations).where(
-                        WeatherStations.weather_station_id
-                        == weather_station.weather_station_id
-                    )
-                ).first()
-
-                # if weather_station already exists, update it
-                if remote_model:
-                    upsert_model = remote_model
-
-                for key, value in weather_station.model_dump(
-                    exclude_unset=True
-                ).items():
-                    setattr(upsert_model, key, value)
-
-                session.add(upsert_model)
-
+            session.execute(stmt)
             session.commit()
 
-        logger.info(f"Saved {len(weather_stations)} weather stations to database")
+        logger.info(f"Upserted {len(records)} weather stations to database")
 
     def load_from_database(self, only_relevant: bool = True) -> pd.DataFrame:
         """
@@ -217,14 +212,15 @@ class WeatherStationDataProvider:
         @return: The weather stations DataFrame.
         """
         with Session(self.database_service.engine) as session:
-            query = select(WeatherStations)
+            table = WeatherStations.__table__
+            query = select(table)
             if only_relevant:
-                query = query.where(WeatherStations.is_active == True).where(
-                    WeatherStations.state == "Brandenburg"
+                query = query.where(table.c.is_active == True).where(
+                    table.c.state == "Brandenburg"
                 )
-            query = query.order_by(WeatherStations.weather_station_id)
+            query = query.order_by(table.c.weather_station_id)
 
-            results = session.exec(query).all()
-            df = pd.DataFrame([row.model_dump() for row in results])
+            rows = session.execute(query).mappings().all()
+            df = pd.DataFrame(rows)
             logger.info(f"Loaded {len(df)} weather stations from database")
             return df

@@ -1,10 +1,13 @@
 import io
+import time
 import zipfile
 from loguru import logger
 from omegaconf import OmegaConf
 import pandas as pd
 import requests
-from sqlmodel import Session, select
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.schema import WindStationMeasurements
 from src.database.database_service import DatabaseService
@@ -113,50 +116,65 @@ class MeasurementDataProvider:
         Save the measurement DataFrame to the database.
         @param df: The measurement DataFrame.
         """
-        measurements = [
-            WindStationMeasurements(**row) for row in df.to_dict(orient="records")
+        table = WindStationMeasurements.__table__
+        allowed_columns = set(table.columns.keys())
+        records = [
+            {k: v for k, v in row.items() if k in allowed_columns}
+            for row in df.to_dict(orient="records")
         ]
 
-        with Session(self.database_service.engine) as session:
-            for measurement in measurements:
-                # check if measurement already exists
-                remote_model = session.exec(
-                    select(WindStationMeasurements)
-                    .where(
-                        WindStationMeasurements.record_date == measurement.record_date
+        if not records:
+            logger.info("No measurements to upsert")
+            return
+
+        chunk_size = getattr(
+            getattr(self.cfg, "database", object()),
+            "measurement_upsert_chunk_size",
+            10000,
+        )
+        max_retries = 3
+
+        total = len(records)
+        for start in range(0, total, chunk_size):
+            chunk = records[start : start + chunk_size]
+            attempt = 0
+            while True:
+                try:
+                    stmt = pg_insert(table).values(chunk)
+                    update_columns = {
+                        c.name: stmt.excluded[c.name]
+                        for c in table.columns
+                        if c.name not in {"id"}
+                    }
+                    stmt = stmt.on_conflict_do_update(
+                        constraint="uix_station_date",
+                        set_=update_columns,
                     )
-                    .where(WindStationMeasurements.station_id == measurement.station_id)
-                ).first()
 
-                # if measurement already exists, update it
-                if remote_model:
-                    upsert_model = remote_model
-                else:
-                    upsert_model = measurement
+                    with Session(self.database_service.engine) as session:
+                        session.execute(stmt)
+                        session.commit()
 
-                for key, value in measurement.model_dump(exclude_unset=True).items():
-                    setattr(upsert_model, key, value)
+                    logger.info(
+                        f"Upserted measurements chunk {start}-{min(start+chunk_size, total)} of {total}"
+                    )
+                    break
+                except Exception as e:
+                    attempt += 1
+                    if attempt >= max_retries:
+                        logger.error(
+                            f"Failed upserting measurements chunk {start}-{min(start+chunk_size, total)} after {max_retries} attempts: {e}"
+                        )
+                        raise
+                    sleep_s = 2 ** (attempt - 1)
+                    logger.warning(
+                        f"Error during upsert (attempt {attempt}/{max_retries}) for chunk {start}-{min(start+chunk_size, total)}: {e}. Retrying in {sleep_s}s"
+                    )
+                    time.sleep(sleep_s)
 
-                session.add(upsert_model)
-
-            session.commit()
-
-        logger.info(f"Saved {len(measurements)} measurements to database")
-
-    def bulk_save_measurement_df_to_database(self, df: pd.DataFrame) -> None:
-        """
-        Bulk save the measurement DataFrame to the database. Cannot handle duplicates. If a duplicate is in the dataframe, it will raise an exception.
-        @param df: The measurement DataFrame.
-        """
-        measurements = [
-            WindStationMeasurements(**row) for row in df.to_dict(orient="records")
-        ]
-
-        with Session(self.database_service.engine) as session:
-            session.add_all(measurements)
-            session.commit()
-
-        logger.info(f"Saved {len(measurements)} measurements to database")
+        logger.info(
+            f"Upserted {total} measurements to database in chunks of {chunk_size}"
+        )
 
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False

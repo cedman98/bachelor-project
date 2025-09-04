@@ -7,7 +7,9 @@ from loguru import logger
 from omegaconf import OmegaConf
 import pandas as pd
 import requests
-from sqlmodel import Session, select
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.database.schema import WindTurbines
 from src.database.database_service import DatabaseService
 import xml.etree.ElementTree as ET
@@ -144,44 +146,38 @@ class WindTurbinesDataProvider:
         Save the wind turbines DataFrame to the database.
         @param df: The wind turbines DataFrame.
         """
-        wind_turbines = [WindTurbines(**row) for row in df.to_dict(orient="records")]
+        table = WindTurbines.__table__
+        allowed_columns = set(table.columns.keys())
+        records = [
+            {k: v for k, v in row.items() if k in allowed_columns}
+            for row in df.to_dict(orient="records")
+        ]
+
+        stmt = pg_insert(table).values(records)
+        update_columns = {
+            c.name: stmt.excluded[c.name]
+            for c in table.columns
+            if c.name != "unit_mastr_number"
+        }
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["unit_mastr_number"], set_=update_columns
+        )
 
         with Session(self.database_service.engine) as session:
-            for wind_turbine in wind_turbines:
-                # check if measurement already exists
-                remote_model = session.exec(
-                    select(WindTurbines)
-                    .where(
-                        WindTurbines.unit_mastr_number == wind_turbine.unit_mastr_number
-                    )
-                    .where(
-                        WindTurbines.unit_mastr_number == wind_turbine.unit_mastr_number
-                    )
-                ).first()
-
-                # if measurement already exists, update it
-                if remote_model:
-                    upsert_model = remote_model
-                else:
-                    upsert_model = wind_turbine
-
-                for key, value in wind_turbine.model_dump(exclude_unset=True).items():
-                    setattr(upsert_model, key, value)
-
-                session.add(upsert_model)
-
+            session.execute(stmt)
             session.commit()
 
-        logger.info(f"Saved {len(wind_turbines)} wind turbines to database")
+        logger.info(f"Upserted {len(records)} wind turbines to database")
 
     def load_from_database(self) -> pd.DataFrame:
         """
         Load the wind turbines from the database.
         """
         with Session(self.database_service.engine) as session:
-            query = select(WindTurbines)
-            results = session.exec(query).all()
-            df = pd.DataFrame([row.model_dump() for row in results])
+            table = WindTurbines.__table__
+            query = select(table)
+            rows = session.execute(query).mappings().all()
+            df = pd.DataFrame(rows)
             logger.info(f"Loaded {len(df)} wind turbines from database")
             return df
 

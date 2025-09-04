@@ -31,14 +31,11 @@ class MeasurementService:
             else MeasurementDataProvider(cfg, database_service)
         )
 
-    def fill_database_with_measurements(
-        self, only_now: bool = False, bulk_save: bool = False
-    ):
+    def fill_database_with_measurements(self, only_now: bool = False):
         """
         Fill the database with the measurements from DWD for the measurement stations.
-        If you want to fill the database for the first time, you should use bulk_save=True and only_now=False. Use only_now=True if and bulk_save=False during filling it hourly
+        If you want to fill the database for the first time, you should use only_now=False to load also all historical data. Use only_now=True if and only if you want to load the current data (current day).
         @param only_now: If True, only get the now data (current day).
-        @param bulk_save: If True, use the bulk save function to save the measurements to the database.
         @return: The weather stations DataFrame. The df is also stored in the service.
         """
         for weather_station in self.weather_stations.itertuples():
@@ -72,14 +69,9 @@ class MeasurementService:
                 return None
 
             try:
-                if bulk_save:
-                    self.measurement_data_provider.bulk_save_measurement_df_to_database(
-                        processed_measurement_df
-                    )
-                else:
-                    self.measurement_data_provider.save_measurement_df_to_database(
-                        processed_measurement_df
-                    )
+                self.measurement_data_provider.save_measurement_df_to_database(
+                    processed_measurement_df
+                )
 
             except Exception as e:
                 logger.error(
