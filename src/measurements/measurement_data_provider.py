@@ -1,3 +1,4 @@
+from datetime import datetime
 import io
 import time
 import zipfile
@@ -175,6 +176,38 @@ class MeasurementDataProvider:
         logger.info(
             f"Upserted {total} measurements to database in chunks of {chunk_size}"
         )
+
+    def load_measurements_from_database_for_datetime(
+        self, weather_stations: pd.DataFrame, datetime: datetime
+    ) -> pd.DataFrame:
+        """
+        Load the measurements from the database for a specific datetime.
+        @param datetime: The datetime.
+        @return: The measurements DataFrame.
+        """
+        table = WindStationMeasurements.__table__
+        query = (
+            select(table)
+            .where(table.c.record_date == datetime)
+            .where(
+                table.c.station_id.in_(weather_stations["weather_station_id"].tolist())
+            )
+        )
+
+        with Session(self.database_service.engine) as session:
+            rows = session.execute(query).mappings().all()
+            df = pd.DataFrame(rows)
+            logger.info(
+                f"Loaded {len(df)} measurements from database for datetime {datetime}"
+            )
+
+            # Drop rows where average_wind_direction or average_wind_speed is -999
+            df = df[
+                (df["average_wind_direction"] != -999)
+                & (df["average_wind_speed"] != -999)
+            ]
+
+            return df
 
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False

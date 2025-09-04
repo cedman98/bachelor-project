@@ -1,3 +1,4 @@
+from datetime import datetime
 from loguru import logger
 from omegaconf import OmegaConf
 import pandas as pd
@@ -82,3 +83,21 @@ class MeasurementService:
         logger.info(
             f"Filled database with measurements for {len(self.weather_stations)} weather stations"
         )
+
+    def load_measurements_from_database_for_datetime(
+        self, datetime: datetime
+    ) -> pd.DataFrame:
+        if self.weather_stations is None:
+            raise ValueError(
+                "No weather stations loaded. Please load the weather stations first."
+            )
+
+        try:
+            return self.measurement_data_provider.load_measurements_from_database_for_datetime(
+                self.weather_stations, datetime
+            )
+        except Exception as e:
+            logger.error(
+                f"Error loading measurements from database for datetime {datetime}: {e}"
+            )
+            return None
