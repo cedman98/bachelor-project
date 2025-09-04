@@ -45,6 +45,11 @@ class WindStationMeasurements(Base):
     quality_level: Mapped[int] = mapped_column(Integer)
     average_wind_speed: Mapped[float] = mapped_column(Float)
     average_wind_direction: Mapped[float] = mapped_column(Float)
+    air_pressure: Mapped[float] = mapped_column(Float)
+    air_temperature_2m: Mapped[float] = mapped_column(Float)
+    air_temperature_5cm: Mapped[float] = mapped_column(Float)
+    relative_humidity: Mapped[float] = mapped_column(Float)
+    dew_point_temperature: Mapped[float] = mapped_column(Float)
     record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 

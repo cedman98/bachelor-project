@@ -39,7 +39,7 @@ class MeasurementService:
         @param only_now: If True, only get the now data (current day).
         @return: The weather stations DataFrame. The df is also stored in the service.
         """
-        for weather_station in self.weather_stations.itertuples():
+        for weather_station in self.weather_stations.iloc[:1].itertuples():
             weather_station_id = weather_station.weather_station_id
             try:
                 raw_measurement_df = self.measurement_data_provider.download_measurements_for_weather_station(
@@ -55,7 +55,7 @@ class MeasurementService:
                 logger.error(
                     f"Error downloading measurements for weather station {weather_station_id}: {e}"
                 )
-                return None
+                raise e
 
             try:
                 processed_measurement_df = (
@@ -67,7 +67,7 @@ class MeasurementService:
                 logger.error(
                     f"Error processing measurements for weather station {weather_station_id}: {e}"
                 )
-                return None
+                raise e
 
             try:
                 self.measurement_data_provider.save_measurement_df_to_database(
@@ -78,7 +78,7 @@ class MeasurementService:
                 logger.error(
                     f"Error saving measurements to database for weather station {weather_station_id}: {e}"
                 )
-                return None
+                raise e
 
         logger.info(
             f"Filled database with measurements for {len(self.weather_stations)} weather stations"
