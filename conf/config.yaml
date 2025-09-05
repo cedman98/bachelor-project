@@ -11,3 +11,46 @@ marktstammdatenregister:
   wind_turbines_explanation_download_url: "https://www.marktstammdatenregister.de/MaStRHilfe/files/gesamtdatenexport/Dokumentation%20MaStR%20Gesamtdatenexport.zip"
   wind_turbines_explanation_file_name: "xsd/EinheitenWind.xsd"
   wind_turbines_explanation_local_path: "data/EinheitenWind.xsd"
+
+processing:
+  measurements:
+    final_columns:
+      - "station_id"
+      - "record_date"
+      - "average_wind_speed"
+      - "average_wind_direction"
+      - "air_pressure"
+      - "air_temperature_2m"
+      - "air_temperature_5cm"
+      - "relative_humidity"
+      - "dew_point_temperature"
+      - "precipitation_duration"
+      - "sum_precipitation_height"
+      - "precipitation_indicator"
+      - "quality_level"
+  weather_stations:
+    final_columns:
+      - "weather_station_id"
+      - "height"
+      - "latitude"
+      - "longitude"
+      - "name"
+      - "state"
+      - "start_date"
+      - "end_date"
+      - "accessible"
+      - "is_active"
+  wind_turbines:
+    final_columns:
+      - "unit_mastr_number"
+      - "last_update_date"
+      - "longitude"
+      - "latitude"
+      - "final_decommission_date"
+      - "gross_power"
+      - "net_nominal_power"
+      - "manufacturer"
+      - "technology"
+      - "type_designation"
+      - "hub_height"
+      - "rotor_diameter"

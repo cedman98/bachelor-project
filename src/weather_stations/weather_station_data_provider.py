@@ -154,18 +154,8 @@ class WeatherStationDataProvider:
         @return: A processed DataFrame with the weather stations.
         """
         dr = h_driver.Driver({}, wsp)
-        final_columns = [
-            "weather_station_id",
-            "height",
-            "latitude",
-            "longitude",
-            "name",
-            "state",
-            "start_date",
-            "end_date",
-            "accessible",
-            "is_active",
-        ]
+        final_columns = self.cfg.processing.weather_stations.final_columns
+
         # Pass raw columns directly as inputs
         result = dr.execute(
             final_columns,

@@ -72,20 +72,9 @@ class WindTurbinesDataProvider:
         @return: The processed dataframe.
         """
         dr = h_driver.Driver({}, wtp)
-        final_columns = [
-            "unit_mastr_number",
-            "last_update_date",
-            "longitude",
-            "latitude",
-            "final_decommission_date",
-            "gross_power",
-            "net_nominal_power",
-            "manufacturer",
-            "technology",
-            "type_designation",
-            "hub_height",
-            "rotor_diameter",
-        ]
+
+        final_columns = self.cfg.processing.wind_turbines.final_columns
+
         outputs = final_columns + ["keep_mask"]
         result = dr.execute(
             outputs,

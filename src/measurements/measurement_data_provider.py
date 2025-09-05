@@ -131,22 +131,7 @@ class MeasurementDataProvider:
 
         dr = h_driver.Driver({}, mp)
 
-        # Specify the final columns explicitly; this controls renaming & dropping.
-        final_columns = [
-            "station_id",
-            "record_date",
-            "average_wind_speed",
-            "average_wind_direction",
-            "air_pressure",
-            "air_temperature_2m",
-            "air_temperature_5cm",
-            "relative_humidity",
-            "dew_point_temperature",
-            "precipitation_duration",
-            "sum_precipitation_height",
-            "precipitation_indicator",
-            "quality_level",
-        ]
+        final_columns = self.cfg.processing.measurements.final_columns
 
         # We also compute the mask to drop invalid rows (no station_id or record_date), but don't keep it as a final column.
         outputs = final_columns + ["valid_row_mask"]
