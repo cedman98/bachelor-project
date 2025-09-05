@@ -13,6 +13,9 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.database.schema import WindStationMeasurements
 from src.database.database_service import DatabaseService
 
+from hamilton import driver as h_driver
+from src.measurements import measurement_preprocess as mp
+
 
 class MeasurementDataProvider:
     """
@@ -121,111 +124,40 @@ class MeasurementDataProvider:
 
     def process_measurement_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Process the measurement dataframe.
-        @param df: The measurement dataframe.
-        @return: The processed dataframe.
+        Process the measurement dataframe using Hamilton dataflow defined in
+        `src.measurements.measurement_preprocess`. The final DataFrame remains
+        identical in structure and typing to the previous implementation.
         """
-        # Fix column names
-        df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
 
-        df["record_date"] = pd.to_datetime(
-            df["MESS_DATUM"], format="%Y%m%d%H%M", errors="coerce"
-        )
+        dr = h_driver.Driver({}, mp)
 
-        df.rename(
-            columns={
-                "FF_10": "average_wind_speed",
-                "DD_10": "average_wind_direction",
-                "PP_10": "air_pressure",
-                "TT_10": "air_temperature_2m",
-                "TM5_10": "air_temperature_5cm",
-                "RF_10": "relative_humidity",
-                "TD_10": "dew_point_temperature",
-                "RWS_DAU_10": "precipitation_duration",
-                "RWS_10": "sum_precipitation_height",
-                "RWS_IND_10": "precipitation_indicator",
-                "QN": "quality_level",
-                "STATIONS_ID": "station_id",
-            },
-            inplace=True,
-        )
+        # Specify the final columns explicitly; this controls renaming & dropping.
+        final_columns = [
+            "station_id",
+            "record_date",
+            "average_wind_speed",
+            "average_wind_direction",
+            "air_pressure",
+            "air_temperature_2m",
+            "air_temperature_5cm",
+            "relative_humidity",
+            "dew_point_temperature",
+            "precipitation_duration",
+            "sum_precipitation_height",
+            "precipitation_indicator",
+            "quality_level",
+        ]
 
-        df.drop(columns=["eor", "MESS_DATUM"], inplace=True, errors="ignore")
+        # We also compute the mask to drop invalid rows (no station_id or record_date), but don't keep it as a final column.
+        outputs = final_columns + ["valid_row_mask"]
+        result = dr.execute(outputs, inputs={"raw_df": df})
 
-        # Ensure required identifiers are valid before casting to int
-        if "station_id" in df.columns:
-            df["station_id"] = pd.to_numeric(df["station_id"], errors="coerce")
-        # Drop rows lacking a station_id or record_date
-        df = df.dropna(
-            subset=[col for col in ["station_id", "record_date"] if col in df.columns]
-        )
+        # Convert to DataFrame and filter invalid rows, mirroring previous logic.
+        out_df = pd.DataFrame(result)
+        out_df = out_df[out_df["valid_row_mask"]].copy()
+        out_df.drop(columns=["valid_row_mask"], inplace=True)
 
-        # Set data types
-        if "station_id" in df.columns:
-            df["station_id"] = df["station_id"].astype(int)
-        if "quality_level" in df.columns:
-            df["quality_level"] = (
-                pd.to_numeric(df["quality_level"], errors="coerce")
-                .fillna(-1)
-                .astype(int)
-            )
-        df["average_wind_direction"] = (
-            pd.to_numeric(df["average_wind_direction"], errors="coerce")
-            .fillna(-999)
-            .astype(int)
-        )
-        df["air_pressure"] = (
-            pd.to_numeric(df["air_pressure"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["air_temperature_2m"] = (
-            pd.to_numeric(df["air_temperature_2m"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["air_temperature_5cm"] = (
-            pd.to_numeric(df["air_temperature_5cm"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["relative_humidity"] = (
-            pd.to_numeric(df["relative_humidity"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["dew_point_temperature"] = (
-            pd.to_numeric(df["dew_point_temperature"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["precipitation_duration"] = (
-            pd.to_numeric(df["precipitation_duration"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["sum_precipitation_height"] = (
-            pd.to_numeric(df["sum_precipitation_height"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["precipitation_indicator"] = (
-            pd.to_numeric(df["precipitation_indicator"], errors="coerce")
-            .fillna(-999)
-            .astype(int)
-        )
-        df["average_wind_speed"] = (
-            pd.to_numeric(df["average_wind_speed"], errors="coerce")
-            .fillna(-999)
-            .astype(float)
-        )
-        df["average_wind_direction"] = (
-            pd.to_numeric(df["average_wind_direction"], errors="coerce")
-            .fillna(-999)
-            .astype(int)
-        )
-
-        return df
+        return out_df.reset_index(drop=True)
 
     def save_measurement_df_to_database(self, df: pd.DataFrame) -> None:
         """

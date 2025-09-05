@@ -8,6 +8,8 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.schema import WeatherStations
 from src.database.database_service import DatabaseService
+from hamilton import driver as h_driver
+from src.weather_stations import weather_station_preprocess as wsp
 
 
 class WeatherStationDataProvider:
@@ -147,35 +149,41 @@ class WeatherStationDataProvider:
 
     def process_weather_stations_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Process the weather stations DataFrame and return a processed DataFrame.
+        Process the weather stations DataFrame and return a processed DataFrame using Hamilton.
         @param df: The weather stations DataFrame.
         @return: A processed DataFrame with the weather stations.
         """
-        # Set data types
-        df["weather_station_id"] = df["weather_station_id"].astype(int)
-        df["height"] = df["height"].astype(int)
-        df["latitude"] = df["latitude"].astype(float)
-        df["longitude"] = df["longitude"].astype(float)
-        df["name"] = df["name"].astype(str)
-        df["state"] = df["state"].astype(str)
-
-        # Convert start_date and end_date to date
-        df["start_date"] = pd.to_datetime(
-            df["start_date"], format="%Y%m%d", errors="coerce"
-        ).dt.date
-        df["end_date"] = pd.to_datetime(
-            df["end_date"], format="%Y%m%d", errors="coerce"
-        ).dt.date
-
-        # New features
-        df["accessible"] = (df["accessible"].str.strip() == "Frei").astype(bool)
-        df["is_active"] = (
-            df["end_date"] >= (pd.Timestamp.now() - pd.Timedelta(days=5)).date()
+        dr = h_driver.Driver({}, wsp)
+        final_columns = [
+            "weather_station_id",
+            "height",
+            "latitude",
+            "longitude",
+            "name",
+            "state",
+            "start_date",
+            "end_date",
+            "accessible",
+            "is_active",
+        ]
+        # Pass raw columns directly as inputs
+        result = dr.execute(
+            final_columns,
+            inputs={
+                "raw_weather_station_id": df["weather_station_id"],
+                "raw_height": df["height"],
+                "raw_latitude": df["latitude"],
+                "raw_longitude": df["longitude"],
+                "raw_name": df["name"],
+                "raw_state": df["state"],
+                "raw_start_date": df["start_date"],
+                "raw_end_date": df["end_date"],
+                "raw_accessible": df["accessible"],
+            },
         )
-
-        logger.info(f"Processed {len(df)} stations")
-
-        return df
+        out_df = pd.DataFrame(result)
+        logger.info(f"Processed {len(out_df)} stations")
+        return out_df
 
     def save_weather_stations_to_database(self, df: pd.DataFrame):
         """

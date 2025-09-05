@@ -12,6 +12,8 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from src.database.schema import WindTurbines
 from src.database.database_service import DatabaseService
+from hamilton import driver as h_driver
+from src.wind_turbines import wind_turbines_preprocess as wtp
 import xml.etree.ElementTree as ET
 
 
@@ -65,81 +67,53 @@ class WindTurbinesDataProvider:
 
     def process_wind_turbines_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Process the wind turbines dataframe.
+        Process the wind turbines dataframe using Hamilton.
         @param df: The wind turbines dataframe.
         @return: The processed dataframe.
         """
-
-        # Drop rows where bundesland is not 1400 (Brandenburg)
-        df = df[df["Bundesland"] == 1400].copy()
-        df.drop(columns=["Bundesland"], inplace=True)
-
-        df = df[
-            [
-                "EinheitMastrNummer",
-                "DatumLetzteAktualisierung",
-                "Laengengrad",
-                "Breitengrad",
-                "DatumEndgueltigeStilllegung",
-                "Bruttoleistung",
-                "Nettonennleistung",
-                "Hersteller",
-                "Technologie",
-                "Typenbezeichnung",
-                "Nabenhoehe",
-                "Rotordurchmesser",
-            ]
+        dr = h_driver.Driver({}, wtp)
+        final_columns = [
+            "unit_mastr_number",
+            "last_update_date",
+            "longitude",
+            "latitude",
+            "final_decommission_date",
+            "gross_power",
+            "net_nominal_power",
+            "manufacturer",
+            "technology",
+            "type_designation",
+            "hub_height",
+            "rotor_diameter",
         ]
-
-        df.rename(
-            columns={
-                "EinheitMastrNummer": "unit_mastr_number",
-                "DatumLetzteAktualisierung": "last_update_date",
-                "Laengengrad": "longitude",
-                "Breitengrad": "latitude",
-                "DatumEndgueltigeStilllegung": "final_decommission_date",
-                "Bruttoleistung": "gross_power",
-                "Nettonennleistung": "net_nominal_power",
-                "Hersteller": "manufacturer",
-                "Technologie": "technology",
-                "Typenbezeichnung": "type_designation",
-                "Nabenhoehe": "hub_height",
-                "Rotordurchmesser": "rotor_diameter",
+        outputs = final_columns + ["keep_mask"]
+        result = dr.execute(
+            outputs,
+            inputs={
+                # raw filters/flags
+                "raw_Bundesland": df["Bundesland"],
+                # raw fields
+                "raw_EinheitMastrNummer": df["EinheitMastrNummer"],
+                "raw_DatumLetzteAktualisierung": df["DatumLetzteAktualisierung"],
+                "raw_Laengengrad": df["Laengengrad"],
+                "raw_Breitengrad": df["Breitengrad"],
+                "raw_DatumEndgueltigeStilllegung": df["DatumEndgueltigeStilllegung"],
+                "raw_Bruttoleistung": df["Bruttoleistung"],
+                "raw_Nettonennleistung": df["Nettonennleistung"],
+                "raw_Hersteller": df["Hersteller"],
+                "raw_Technologie": df["Technologie"],
+                "raw_Typenbezeichnung": df["Typenbezeichnung"],
+                "raw_Nabenhoehe": df["Nabenhoehe"],
+                "raw_Rotordurchmesser": df["Rotordurchmesser"],
             },
-            inplace=True,
         )
 
-        # Drop rows where latitude or longitude is None
-        df = df[
-            df["latitude"].notna()
-            & df["longitude"].notna()
-            & df["hub_height"].notna()
-            & df["rotor_diameter"].notna()
-        ]
+        out_df = pd.DataFrame(result)
+        out_df = out_df[out_df["keep_mask"]].copy()
+        out_df.drop(columns=["keep_mask"], inplace=True)
 
-        # Convert data types
-        df["last_update_date"] = pd.to_datetime(df["last_update_date"])
-        s = pd.to_datetime(
-            df["final_decommission_date"], format="%Y-%m-%d", errors="coerce"
-        )
-        df["final_decommission_date"] = s.dt.date.where(s.notna(), None)
-        df["longitude"] = df["longitude"].astype(float)
-        df["latitude"] = df["latitude"].astype(float)
-        df["gross_power"] = df["gross_power"].astype(float)
-        df["net_nominal_power"] = df["net_nominal_power"].astype(float)
-        df["hub_height"] = df["hub_height"].astype(float)
-        df["rotor_diameter"] = df["rotor_diameter"].astype(float)
-        df["manufacturer"] = pd.to_numeric(df["manufacturer"], errors="coerce").astype(
-            "Int64"
-        )
-        df["technology"] = pd.to_numeric(df["technology"], errors="coerce").astype(
-            "Int64"
-        )
-        df["type_designation"] = df["type_designation"].astype(str)
-
-        logger.info(f"Processed {len(df)} wind turbines")
-
-        return df
+        logger.info(f"Processed {len(out_df)} wind turbines")
+        return out_df.reset_index(drop=True)
 
     def save_wind_turbines_df_to_database(self, df: pd.DataFrame) -> None:
         """
