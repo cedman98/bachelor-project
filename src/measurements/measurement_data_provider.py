@@ -49,38 +49,73 @@ class MeasurementDataProvider:
             only_now=only_now,
         )
 
-        if wind_df.empty and air_temp_df.empty:
+        precipitation_df = self._download_dataset_for_station(
+            weather_station_id=weather_station_id,
+            dataset="precipitation",
+            only_now=only_now,
+        )
+
+        # Always ensure we don't create duplicate QN/eor columns during merge
+        # Drop from secondary datasets regardless of emptiness
+        air_temp_df.drop(columns=["eor", "QN"], inplace=True, errors="ignore")
+        precipitation_df.drop(columns=["eor", "QN"], inplace=True, errors="ignore")
+
+        if wind_df.empty and air_temp_df.empty and precipitation_df.empty:
             logger.warning(
-                f"No dataframes downloaded for weather station {weather_station_id} (wind or air_temperature)"
+                f"No dataframes downloaded for weather station {weather_station_id} (wind, air_temperature, precipitation)"
             )
-            return pd.DataFrame()
+            # Continue to merge below to return an empty df with all expected columns
 
-        # Drop eor and QN from air_temperature dataframe to avoid column collisions
-        if not air_temp_df.empty:
-            air_temp_df.drop(columns=["eor", "QN"], inplace=True)
+        # Merge on station and timestamp. Always include all datasets so that
+        # missing datasets still contribute their columns (filled with NaN here).
+        dataframes = [wind_df, air_temp_df, precipitation_df]
 
-        # Merge on station and timestamp; keep all records to allow later preprocessing
-        if wind_df.empty:
-            merged_df = air_temp_df
-        elif air_temp_df.empty:
-            merged_df = wind_df
-        else:
+        # Initialize with empty frame that has join keys so merges never fail
+        merged_df = pd.DataFrame(columns=["STATIONS_ID", "MESS_DATUM"])
+        for df in dataframes:
+            if df is None or df.empty:
+                continue
+            if not {"STATIONS_ID", "MESS_DATUM"}.issubset(df.columns):
+                logger.warning(
+                    "Skipping merge for dataset missing join keys ['STATIONS_ID','MESS_DATUM']"
+                )
+                continue
             merged_df = pd.merge(
-                wind_df,
-                air_temp_df,
+                merged_df,
+                df,
                 on=["STATIONS_ID", "MESS_DATUM"],
                 how="outer",
                 copy=False,
             )
 
+        # Ensure all expected original columns exist so downstream processing can rename
+        expected_columns = [
+            "STATIONS_ID",
+            "MESS_DATUM",
+            "QN",
+            "eor",
+            # wind
+            "FF_10",
+            "DD_10",
+            # air pressure/temperature/humidity
+            "PP_10",
+            "TT_10",
+            "TM5_10",
+            "RF_10",
+            "TD_10",
+            # precipitation
+            "RWS_DAU_10",
+            "RWS_10",
+            "RWS_IND_10",
+        ]
+        for col in expected_columns:
+            if col not in merged_df.columns:
+                merged_df[col] = pd.NA
+
         # Final de-dup per station and timestamp
         merged_df = merged_df.drop_duplicates(
             subset=["STATIONS_ID", "MESS_DATUM"], keep="last"
         ).reset_index(drop=True)
-
-        logger.info(
-            f"Combined dataframe with {len(merged_df)} rows for weather station {weather_station_id} (wind + air_temperature)"
-        )
 
         return merged_df
 
@@ -106,6 +141,9 @@ class MeasurementDataProvider:
                 "TM5_10": "air_temperature_5cm",
                 "RF_10": "relative_humidity",
                 "TD_10": "dew_point_temperature",
+                "RWS_DAU_10": "precipitation_duration",
+                "RWS_10": "sum_precipitation_height",
+                "RWS_IND_10": "precipitation_indicator",
                 "QN": "quality_level",
                 "STATIONS_ID": "station_id",
             },
@@ -114,15 +152,68 @@ class MeasurementDataProvider:
 
         df.drop(columns=["eor", "MESS_DATUM"], inplace=True, errors="ignore")
 
+        # Ensure required identifiers are valid before casting to int
+        if "station_id" in df.columns:
+            df["station_id"] = pd.to_numeric(df["station_id"], errors="coerce")
+        # Drop rows lacking a station_id or record_date
+        df = df.dropna(
+            subset=[col for col in ["station_id", "record_date"] if col in df.columns]
+        )
+
         # Set data types
-        df["station_id"] = df["station_id"].astype(int)
-        df["quality_level"] = df["quality_level"].astype(int)
-        df["average_wind_direction"] = df["average_wind_direction"].astype(int)
-        df["air_pressure"] = df["air_pressure"].astype(float)
-        df["air_temperature_2m"] = df["air_temperature_2m"].astype(float)
-        df["air_temperature_5cm"] = df["air_temperature_5cm"].astype(float)
-        df["relative_humidity"] = df["relative_humidity"].astype(float)
-        df["dew_point_temperature"] = df["dew_point_temperature"].astype(float)
+        if "station_id" in df.columns:
+            df["station_id"] = df["station_id"].astype(int)
+        if "quality_level" in df.columns:
+            df["quality_level"] = (
+                pd.to_numeric(df["quality_level"], errors="coerce")
+                .fillna(-1)
+                .astype(int)
+            )
+        df["average_wind_direction"] = (
+            pd.to_numeric(df["average_wind_direction"], errors="coerce")
+            .fillna(-999)
+            .astype(int)
+        )
+        df["air_pressure"] = (
+            pd.to_numeric(df["air_pressure"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["air_temperature_2m"] = (
+            pd.to_numeric(df["air_temperature_2m"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["air_temperature_5cm"] = (
+            pd.to_numeric(df["air_temperature_5cm"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["relative_humidity"] = (
+            pd.to_numeric(df["relative_humidity"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["dew_point_temperature"] = (
+            pd.to_numeric(df["dew_point_temperature"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["precipitation_duration"] = (
+            pd.to_numeric(df["precipitation_duration"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["sum_precipitation_height"] = (
+            pd.to_numeric(df["sum_precipitation_height"], errors="coerce")
+            .fillna(-999)
+            .astype(float)
+        )
+        df["precipitation_indicator"] = (
+            pd.to_numeric(df["precipitation_indicator"], errors="coerce")
+            .fillna(-999)
+            .astype(int)
+        )
         df["average_wind_speed"] = (
             pd.to_numeric(df["average_wind_speed"], errors="coerce")
             .fillna(-999)
@@ -132,10 +223,6 @@ class MeasurementDataProvider:
             pd.to_numeric(df["average_wind_direction"], errors="coerce")
             .fillna(-999)
             .astype(int)
-        )
-
-        logger.info(
-            f"Processed {len(df)} measurements for weather station {df['station_id'].iloc[0]}"
         )
 
         return df
@@ -153,7 +240,7 @@ class MeasurementDataProvider:
         ]
 
         if not records:
-            logger.info("No measurements to upsert")
+            logger.warning("No measurements to upsert")
             return
 
         chunk_size = getattr(
@@ -201,10 +288,6 @@ class MeasurementDataProvider:
                     )
                     time.sleep(sleep_s)
 
-        logger.info(
-            f"Upserted {total} measurements to database in chunks of {chunk_size}"
-        )
-
     def load_measurements_from_database_for_datetime(
         self, weather_stations: pd.DataFrame, datetime: datetime
     ) -> pd.DataFrame:
@@ -244,7 +327,7 @@ class MeasurementDataProvider:
         Get the download urls for the measurements.
         @param weather_station_id: The weather station id.
         @param only_now: If True, only get the now download url.
-        @param dataset: Either 'wind' or 'air_temperature'. Determines base URL and filename prefix.
+        @param dataset: Either 'wind' or 'air_temperature' or 'precipitation'. Determines base URL and filename prefix.
         @return: The download urls.
         """
         # Fill with pre zeros to have lentgh 5
@@ -257,9 +340,12 @@ class MeasurementDataProvider:
         elif dataset == "air_temperature":
             base_url = f"{self.cfg.dwd.measurements_base_url}air_temperature/"
             file_prefix = "10minutenwerte_TU"
+        elif dataset == "precipitation":
+            base_url = f"{self.cfg.dwd.measurements_base_url}precipitation/"
+            file_prefix = "10minutenwerte_nieder"
         else:
             raise ValueError(
-                f"Unsupported dataset '{dataset}'. Expected 'wind' or 'air_temperature'"
+                f"Unsupported dataset '{dataset}'. Expected 'wind' or 'air_temperature' or 'precipitation'"
             )
 
         if only_now:
@@ -291,9 +377,7 @@ class MeasurementDataProvider:
                     c.strip() if isinstance(c, str) else c for c in df.columns
                 ]
                 all_dfs.append(df)
-                logger.info(
-                    f"Successfully downloaded and processed {dataset} data from {download_url}"
-                )
+
             except Exception as e:
                 logger.warning(f"Failed to download {dataset} from {download_url}: {e}")
                 continue
@@ -309,9 +393,6 @@ class MeasurementDataProvider:
             subset=["STATIONS_ID", "MESS_DATUM"], keep="last"
         ).reset_index(drop=True)
 
-        logger.info(
-            f"Combined {dataset} dataframe with {len(combined_df)} rows for weather station {weather_station_id}"
-        )
         return combined_df
 
     def _download_file(self, download_url: str) -> pd.DataFrame:
@@ -320,7 +401,6 @@ class MeasurementDataProvider:
         @param download_url: The download url.
         @return: The dataframe.
         """
-        logger.info(f"Start downloading file from {download_url}")
         response = requests.get(download_url)
         response.raise_for_status()  # Raise an exception for bad status codes
 

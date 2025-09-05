@@ -39,7 +39,7 @@ class MeasurementService:
         @param only_now: If True, only get the now data (current day).
         @return: The weather stations DataFrame. The df is also stored in the service.
         """
-        for weather_station in self.weather_stations.iloc[:1].itertuples():
+        for weather_station in self.weather_stations.itertuples():
             weather_station_id = weather_station.weather_station_id
             try:
                 raw_measurement_df = self.measurement_data_provider.download_measurements_for_weather_station(

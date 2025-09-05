@@ -50,6 +50,9 @@ class WindStationMeasurements(Base):
     air_temperature_5cm: Mapped[float] = mapped_column(Float)
     relative_humidity: Mapped[float] = mapped_column(Float)
     dew_point_temperature: Mapped[float] = mapped_column(Float)
+    precipitation_duration: Mapped[float] = mapped_column(Float)
+    sum_precipitation_height: Mapped[float] = mapped_column(Float)
+    precipitation_indicator: Mapped[int] = mapped_column(Integer)
     record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
