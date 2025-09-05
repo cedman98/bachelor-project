@@ -237,6 +237,19 @@ class MeasurementDataProvider:
 
             return df
 
+    def load_all_measurements_from_database(self) -> pd.DataFrame:
+        """
+        Load all measurements from the database.
+        @return: The measurements DataFrame.
+        """
+        table = WindStationMeasurements.__table__
+        query = select(table)
+        with Session(self.database_service.engine) as session:
+            rows = session.execute(query).mappings().all()
+            df = pd.DataFrame(rows)
+            logger.info(f"Loaded {len(df)} measurements from database")
+            return df
+
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False, dataset: str = "wind"
     ) -> list[str]:

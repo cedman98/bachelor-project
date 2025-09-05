@@ -1,0 +1,45 @@
+from loguru import logger
+from omegaconf import OmegaConf
+from src.model.model_dataset_data_provider import ModelDatasetDataProvider
+from src.database.database_service import DatabaseService
+from src.measurements.measurement_service import MeasurementService
+
+
+class ModelService:
+    """
+    The service provides the functionality for loading the model from the database.
+    """
+
+    cfg: OmegaConf
+    database_service: DatabaseService
+
+    def __init__(
+        self,
+        cfg: OmegaConf,
+        database_service: DatabaseService,
+        measurement_service: MeasurementService,
+        model_dataset_data_provider: ModelDatasetDataProvider = None,
+    ):
+        self.cfg = cfg
+        self.database_service = database_service
+        self.measurement_service = measurement_service
+        self.model_dataset_data_provider = (
+            model_dataset_data_provider
+            if model_dataset_data_provider
+            else ModelDatasetDataProvider(cfg, database_service)
+        )
+
+    def load_dataset(self):
+        """
+        Load the dataset from the database.
+        """
+        try:
+            raw_measurements_df = (
+                self.measurement_service.load_all_measurements_from_database()
+            )
+
+        except Exception as e:
+            logger.error(f"Error loading measurements from database: {e}")
+            return None
+
+        return self.model_dataset_data_provider.create_all_features(raw_measurements_df)

@@ -101,3 +101,10 @@ class MeasurementService:
                 f"Error loading measurements from database for datetime {datetime}: {e}"
             )
             return None
+
+    def load_all_measurements_from_database(self) -> pd.DataFrame:
+        """
+        Load all measurements from the database.
+        @return: The measurements DataFrame.
+        """
+        return self.measurement_data_provider.load_all_measurements_from_database()
