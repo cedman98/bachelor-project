@@ -86,4 +86,18 @@ class ModelDatasetDataProvider:
         outputs = list(df.columns) + computed
 
         result_df = dr.execute(final_vars=outputs, inputs=inputs)
+
+        result_df.drop(
+            columns=["average_wind_speed", "average_wind_direction"], inplace=True
+        )
         return result_df
+
+    def save_dataset_as_pickle(
+        self, df: pd.DataFrame, path: str = "data/dataset.pkl"
+    ) -> None:
+        """
+        Save the dataset as a pickle file.
+        @param df: The dataset DataFrame.
+        @param path: The path to save the dataset.
+        """
+        df.to_pickle(path)

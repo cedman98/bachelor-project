@@ -1,0 +1,77 @@
+Beginning AutoGluon training... Time limit = 120s
+AutoGluon will save models to '/Users/matthaei/Documents/code/python/bachelor-project/AutogluonModels/ag-20250908_185926'
+=================== System Info ===================
+AutoGluon Version:  1.4.0
+Python Version:     3.12.10
+Operating System:   Darwin
+Platform Machine:   arm64
+Platform Version:   Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000
+CPU Count:          10
+GPU Count:          1
+Memory Avail:       12.26 GB / 32.00 GB (38.3%)
+Disk Space Avail:   71.53 GB / 926.35 GB (7.7%)
+===================================================
+Setting presets to: medium_quality
+
+Fitting with arguments:
+{'enable_ensemble': True,
+ 'eval_metric': MAE,
+ 'freq': '10min',
+ 'hyperparameters': 'light',
+ 'known_covariates_names': ['air_pressure',
+                            'air_temperature_2m',
+                            'air_temperature_5cm',
+                            'dew_point_temperature',
+                            'id',
+                            'precipitation_duration',
+                            'precipitation_indicator',
+                            'quality_level',
+                            'relative_humidity',
+                            'sum_precipitation_height',
+                            'hour_sin',
+                            'hour_cos',
+                            'doy_sin',
+                            'doy_cos',
+                            'u_lag_1',
+                            'u_lag_3',
+                            'u_lag_6',
+                            'u_lag_12',
+                            'u_lag_24',
+                            'v_lag_1',
+                            'v_lag_3',
+                            'v_lag_6',
+                            'v_lag_12',
+                            'v_lag_24',
+                            'u_roll_mean_3h',
+                            'u_roll_std_3h',
+                            'u_roll_mean_6h',
+                            'u_roll_std_6h',
+                            'v_roll_mean_3h',
+                            'v_roll_std_3h',
+                            'v_roll_mean_6h',
+                            'v_roll_std_6h',
+                            'pressure_tendency_3h',
+                            'pressure_tendency_6h',
+                            'temperature_tendency_3h',
+                            'temperature_tendency_6h'],
+ 'num_val_windows': 1,
+ 'prediction_length': 72,
+ 'quantile_levels': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+ 'random_seed': 123,
+ 'refit_every_n_windows': 1,
+ 'refit_full': False,
+ 'skip_model_selection': False,
+ 'target': 'target',
+ 'time_limit': 120,
+ 'verbosity': 2}
+
+train_data with frequency 'IRREG' has been resampled to frequency '10min'.
+Provided train_data has 2389323 rows (NaN fraction=0.0%), 8 time series. Median time series length is 298701 (min=298605, max=298704). 
+
+Provided data contains following columns:
+	target: 'target'
+	known_covariates:
+		categorical:        []
+		continuous (float): ['air_pressure', 'air_temperature_2m', 'air_temperature_5cm', 'dew_point_temperature', 'id', 'precipitation_duration', ...]
+
+To learn how to fix incorrectly inferred types, please see documentation for TimeSeriesPredictor.fit

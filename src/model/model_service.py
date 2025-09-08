@@ -1,8 +1,10 @@
 from loguru import logger
 from omegaconf import OmegaConf
+from src.model.variant.model_interface import ModelInterface
 from src.model.model_dataset_data_provider import ModelDatasetDataProvider
 from src.database.database_service import DatabaseService
 from src.measurements.measurement_service import MeasurementService
+import pandas as pd
 
 
 class ModelService:
@@ -12,6 +14,10 @@ class ModelService:
 
     cfg: OmegaConf
     database_service: DatabaseService
+    measurement_service: MeasurementService
+    model_dataset_data_provider: ModelDatasetDataProvider
+    model: ModelInterface
+    dataset: pd.DataFrame | None
 
     def __init__(
         self,
@@ -42,4 +48,19 @@ class ModelService:
             logger.error(f"Error loading measurements from database: {e}")
             return None
 
-        return self.model_dataset_data_provider.create_all_features(raw_measurements_df)
+        self.dataset = self.model_dataset_data_provider.create_all_features(
+            raw_measurements_df
+        )
+
+        return self.dataset
+
+    def save_dataset_as_pickle(self, path: str = "data/dataset.pkl") -> None:
+        """
+        Save the dataset as a pickle file.
+        @param df: The dataset DataFrame.
+        @param path: The path to save the dataset.
+        """
+        if self.dataset is None:
+            raise ValueError("Dataset not loaded. Please load the dataset first.")
+
+        self.model_dataset_data_provider.save_dataset_as_pickle(self.dataset, path)
