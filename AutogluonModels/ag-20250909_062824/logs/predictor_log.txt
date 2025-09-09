@@ -1,0 +1,121 @@
+Beginning AutoGluon training... Time limit = 600s
+AutoGluon will save models to '/Users/matthaei/Documents/code/python/bachelor-project/AutogluonModels/ag-20250909_062824'
+=================== System Info ===================
+AutoGluon Version:  1.4.0
+Python Version:     3.12.10
+Operating System:   Darwin
+Platform Machine:   arm64
+Platform Version:   Darwin Kernel Version 24.6.0: Mon Jul 14 11:30:29 PDT 2025; root:xnu-11417.140.69~1/RELEASE_ARM64_T6000
+CPU Count:          10
+GPU Count:          1
+Memory Avail:       11.60 GB / 32.00 GB (36.3%)
+Disk Space Avail:   91.18 GB / 926.35 GB (9.8%)
+===================================================
+Setting presets to: medium_quality
+
+Fitting with arguments:
+{'enable_ensemble': True,
+ 'eval_metric': MAE,
+ 'freq': '10min',
+ 'hyperparameters': 'light',
+ 'known_covariates_names': ['hour_sin', 'hour_cos', 'doy_sin', 'doy_cos'],
+ 'num_val_windows': 1,
+ 'prediction_length': 72,
+ 'quantile_levels': [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9],
+ 'random_seed': 123,
+ 'refit_every_n_windows': 1,
+ 'refit_full': False,
+ 'skip_model_selection': False,
+ 'target': 'target',
+ 'time_limit': 600,
+ 'verbosity': 4}
+
+train_data with frequency 'IRREG' has been resampled to frequency '10min'.
+Provided train_data has 2389323 rows (NaN fraction=0.0%), 8 time series. Median time series length is 298701 (min=298605, max=298704). 
+
+Provided data contains following columns:
+	target: 'target'
+	known_covariates:
+		categorical:        []
+		continuous (float): ['hour_sin', 'hour_cos', 'doy_sin', 'doy_cos']
+
+To learn how to fix incorrectly inferred types, please see documentation for TimeSeriesPredictor.fit
+
+AutoGluon will gauge predictive performance using evaluation metric: 'MAE'
+	This metric's sign has been flipped to adhere to being higher_is_better. The metric score can be multiplied by -1 to get the metric value.
+===================================================
+
+Starting training. Start time is 2025-09-09 08:28:27
+Models that will be trained: ['Naive', 'SeasonalNaive', 'RecursiveTabular', 'DirectTabular', 'ETS', 'Theta', 'Chronos[bolt_small]', 'TemporalFusionTransformer']
+Reserving 66.4s for ensemble
+Training timeseries model Naive. Training for up to 66.4s of the 597.4s of remaining time.
+	Window 0
+Shortening all time series to at most 2500
+		-1.6920      = Validation score (-MAE)
+		0.009   s    = Training runtime
+		1.591   s    = Prediction runtime
+	-1.6920       = Validation score (-MAE)
+	0.29    s     = Training runtime
+	1.59    s     = Validation (prediction) runtime
+Reserving 74.4s for ensemble
+Training timeseries model SeasonalNaive. Training for up to 74.4s of the 595.5s of remaining time.
+	Window 0
+Shortening all time series to at most 2500
+		-1.6079      = Validation score (-MAE)
+		0.008   s    = Training runtime
+		1.035   s    = Prediction runtime
+	-1.6079       = Validation score (-MAE)
+	0.28    s     = Training runtime
+	1.03    s     = Validation (prediction) runtime
+Reserving 84.9s for ensemble
+Training timeseries model RecursiveTabular. Training for up to 84.9s of the 594.2s of remaining time.
+	Window 0
+	Time limit adjusted due to model hyperparameters: 84.69s -> 76.22s (ag.max_time_limit=None, ag.max_time_limit_ratio=0.9
+Shortening all series to at most 125216
+train_df shape: (999424, 55), val_df shape: (576, 55)
+Shortening all series to at most 125216
+		-1.4982      = Validation score (-MAE)
+		11.061  s    = Training runtime
+		1.422   s    = Prediction runtime
+	-1.4982       = Validation score (-MAE)
+	11.34   s     = Training runtime
+	1.42    s     = Validation (prediction) runtime
+Reserving 96.9s for ensemble
+Training timeseries model DirectTabular. Training for up to 96.9s of the 581.4s of remaining time.
+	Window 0
+	Time limit adjusted due to model hyperparameters: 96.72s -> 87.04s (ag.max_time_limit=None, ag.max_time_limit_ratio=0.9
+Shortening all series to at most 125072
+train_df shape: (999424, 55), val_df shape: (576, 55)
+Shortening all series to at most 125144
+Shortening all series to at most 125072
+		-14.3271     = Validation score (-MAE)
+		8.302   s    = Training runtime
+		2.992   s    = Prediction runtime
+	-14.3271      = Validation score (-MAE)
+	8.57    s     = Training runtime
+	2.99    s     = Validation (prediction) runtime
+Reserving 114.0s for ensemble
+Training timeseries model ETS. Training for up to 114.0s of the 569.8s of remaining time.
+	Window 0
+Shortening all time series to at most 2500
+		-1.6805      = Validation score (-MAE)
+		0.160   s    = Training runtime
+		2.584   s    = Prediction runtime
+	-1.6805       = Validation score (-MAE)
+	0.44    s     = Training runtime
+	2.58    s     = Validation (prediction) runtime
+Reserving 141.7s for ensemble
+Training timeseries model Theta. Training for up to 141.7s of the 566.8s of remaining time.
+	Window 0
+Shortening all time series to at most 2500
+		-4.6524      = Validation score (-MAE)
+		0.166   s    = Training runtime
+		0.825   s    = Prediction runtime
+	-4.6524       = Validation score (-MAE)
+	0.44    s     = Training runtime
+	0.82    s     = Validation (prediction) runtime
+Reserving 188.5s for ensemble
+Training timeseries model Chronos[bolt_small]. Training for up to 188.5s of the 565.5s of remaining time.
+	Window 0
+	Time limit adjusted due to model hyperparameters: 188.41s -> 150.73s (ag.max_time_limit=None, ag.max_time_limit_ratio=0.8
+	The prediction_length 72 exceeds model's prediction_length 64. The inference batch_size has been reduced from 256 to 64 to avoid OOM errors.
