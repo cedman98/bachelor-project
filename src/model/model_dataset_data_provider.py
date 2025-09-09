@@ -46,7 +46,7 @@ class ModelDatasetDataProvider:
         # Provide input columns directly
         inputs = {col: df[col] for col in df.columns}
 
-        # Desired outputs: keep all original columns + computed features
+        # Desired outputs: computed features
         computed = [
             # targets
             "u",
@@ -81,15 +81,15 @@ class ModelDatasetDataProvider:
             "pressure_tendency_6h",
             "temperature_tendency_3h",
             "temperature_tendency_6h",
+            "record_date_timestamp",
         ]
 
-        outputs = list(df.columns) + computed
+        outputs = ["station_id"] + computed
 
         result_df = dr.execute(final_vars=outputs, inputs=inputs)
 
-        result_df.drop(
-            columns=["average_wind_speed", "average_wind_direction"], inplace=True
-        )
+        result_df.dropna(inplace=True)
+
         return result_df
 
     def save_dataset_as_pickle(

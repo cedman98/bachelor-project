@@ -94,6 +94,18 @@ def doy_cos(day_of_year: pd.Series) -> pd.Series:
 # Lags for u
 
 
+def u_lag_1_6(u: pd.Series, station_id: pd.Series) -> pd.Series:
+    return _ensure_range_index(
+        _group_shift(u, station_id, 1) - _group_shift(u, station_id, 1 / 6)
+    )
+
+
+def u_lag_3_6(u: pd.Series, station_id: pd.Series) -> pd.Series:
+    return _ensure_range_index(
+        _group_shift(u, station_id, 3) - _group_shift(u, station_id, 3 / 6)
+    )
+
+
 def u_lag_1(u: pd.Series, station_id: pd.Series) -> pd.Series:
     return _ensure_range_index(_group_shift(u, station_id, 1))
 
@@ -115,6 +127,18 @@ def u_lag_24(u: pd.Series, station_id: pd.Series) -> pd.Series:
 
 
 # Lags for v
+
+
+def v_lag_1_6(v: pd.Series, station_id: pd.Series) -> pd.Series:
+    return _ensure_range_index(
+        _group_shift(v, station_id, 1) - _group_shift(v, station_id, 1 / 6)
+    )
+
+
+def v_lag_3_6(v: pd.Series, station_id: pd.Series) -> pd.Series:
+    return _ensure_range_index(
+        _group_shift(v, station_id, 3) - _group_shift(v, station_id, 3 / 6)
+    )
 
 
 def v_lag_1(v: pd.Series, station_id: pd.Series) -> pd.Series:
@@ -200,3 +224,8 @@ def temperature_tendency_6h(
     return _ensure_range_index(
         air_temperature_2m - _group_shift(air_temperature_2m, station_id, 6)
     )
+
+
+def record_date_timestamp(record_date: pd.Series) -> pd.Series:
+    """Convert datetime to Unix timestamp in seconds."""
+    return _ensure_range_index(record_date.astype(np.int64) / 10**9)

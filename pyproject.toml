@@ -16,4 +16,6 @@ dependencies = [
     "requests>=2.32.5",
     "sf-hamilton>=1.88.0",
     "sqlalchemy>=2.0.43",
+    "scikit-learn>=1.7.1",
+    "lightgbm>=4.6.0",
 ]
