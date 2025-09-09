@@ -244,11 +244,35 @@ class MeasurementDataProvider:
         """
         table = WindStationMeasurements.__table__
         query = select(table)
+        chunk_size = 1_000_000
+
+        dataframes: list[pd.DataFrame] = []
+        total_loaded = 0
+
         with Session(self.database_service.engine) as session:
-            rows = session.execute(query).mappings().all()
-            df = pd.DataFrame(rows)
-            logger.info(f"Loaded {len(df)} measurements from database")
-            return df
+            result = session.execute(
+                query.execution_options(stream_results=True)
+            ).mappings()
+
+            while True:
+                chunk = result.fetchmany(chunk_size)
+                if not chunk:
+                    break
+
+                df_chunk = pd.DataFrame(chunk)
+                dataframes.append(df_chunk)
+                total_loaded += len(df_chunk)
+                logger.info(
+                    f"Loaded chunk of {len(df_chunk)} rows (total so far: {total_loaded})"
+                )
+
+        if dataframes:
+            df = pd.concat(dataframes, ignore_index=True)
+        else:
+            df = pd.DataFrame()
+
+        logger.info(f"Loaded {len(df)} measurements from database")
+        return df
 
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False, dataset: str = "wind"

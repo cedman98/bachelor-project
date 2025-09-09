@@ -64,3 +64,21 @@ class ModelService:
             raise ValueError("Dataset not loaded. Please load the dataset first.")
 
         self.model_dataset_data_provider.save_dataset_as_pickle(self.dataset, path)
+
+    # --- Model lifecycle helpers ---
+    def attach_model(self, model: ModelInterface) -> None:
+        self.model = model
+
+    def train_model(self, save_path: str | None = None) -> None:
+        if self.dataset is None:
+            raise ValueError("Dataset not loaded. Call load_dataset() first.")
+        if not hasattr(self, "model") or self.model is None:
+            raise ValueError("Model not attached. Call attach_model(model) first.")
+        self.model.train(self.dataset)
+        if save_path:
+            self.model.save(save_path)
+
+    def load_model(self, path: str) -> None:
+        if not hasattr(self, "model") or self.model is None:
+            raise ValueError("Model not attached. Call attach_model(model) first.")
+        self.model.load(path)
