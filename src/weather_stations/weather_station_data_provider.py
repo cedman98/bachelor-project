@@ -3,7 +3,7 @@ from omegaconf import OmegaConf
 import pandas as pd
 import requests
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from src.database.schema import WeatherStations
@@ -214,7 +214,12 @@ class WeatherStationDataProvider:
             query = select(table)
             if only_relevant:
                 query = query.where(table.c.is_active == True).where(
-                    table.c.state == "Brandenburg"
+                    or_(
+                        table.c.state == "Brandenburg",
+                        table.c.weather_station_id.in_(
+                            self.cfg.dwd.additional_measurement_stations
+                        ),
+                    )
                 )
             query = query.order_by(table.c.weather_station_id)
 
