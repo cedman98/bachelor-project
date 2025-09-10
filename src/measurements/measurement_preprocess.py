@@ -45,70 +45,70 @@ def valid_row_mask(station_id_raw: pd.Series, record_date: pd.Series) -> pd.Seri
             "normalized_df": source("normalized_df"),
             "source_column": value("FF_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "average_wind_direction": {
             "normalized_df": source("normalized_df"),
             "source_column": value("DD_10"),
             "dtype": value("int"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         # air pressure/temperature/humidity
         "air_pressure": {
             "normalized_df": source("normalized_df"),
             "source_column": value("PP_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "air_temperature_2m": {
             "normalized_df": source("normalized_df"),
             "source_column": value("TT_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "air_temperature_5cm": {
             "normalized_df": source("normalized_df"),
             "source_column": value("TM5_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "relative_humidity": {
             "normalized_df": source("normalized_df"),
             "source_column": value("RF_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "dew_point_temperature": {
             "normalized_df": source("normalized_df"),
             "source_column": value("TD_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         # precipitation
         "precipitation_duration": {
             "normalized_df": source("normalized_df"),
             "source_column": value("RWS_DAU_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "sum_precipitation_height": {
             "normalized_df": source("normalized_df"),
             "source_column": value("RWS_10"),
             "dtype": value("float"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         "precipitation_indicator": {
             "normalized_df": source("normalized_df"),
             "source_column": value("RWS_IND_10"),
             "dtype": value("int"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
         # quality
         "quality_level": {
             "normalized_df": source("normalized_df"),
             "source_column": value("QN"),
             "dtype": value("int"),
-            "default_value": value(np.nan),
+            "default_value": value(-999),
         },
     }
 )
