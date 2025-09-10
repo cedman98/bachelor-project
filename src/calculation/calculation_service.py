@@ -2,6 +2,7 @@ from datetime import datetime
 from loguru import logger
 from omegaconf import OmegaConf
 import pandas as pd
+from src.calculation.power_curves_data_provider import PowerCurvesDataProvider
 from src.calculation.wind_calculation_data_provider import WindCalculationDataProvider
 from src.database.database_service import DatabaseService
 from src.measurements.measurement_service import MeasurementService
@@ -14,6 +15,7 @@ class CalculationService:
     wind_turbines: pd.DataFrame
     weather_stations: pd.DataFrame
     measurement_service: MeasurementService
+    power_curves_data_provider: PowerCurvesDataProvider
 
     def __init__(
         self,
@@ -23,6 +25,7 @@ class CalculationService:
         wind_turbines: pd.DataFrame,
         weather_stations: pd.DataFrame,
         wind_calculation_data_provider: WindCalculationDataProvider = None,
+        power_curves_data_provider: PowerCurvesDataProvider = None,
     ):
         self.cfg = cfg
         self.database_service = database_service
@@ -36,6 +39,25 @@ class CalculationService:
                 cfg, database_service, wind_turbines, weather_stations
             )
         )
+        self.power_curves_data_provider = (
+            power_curves_data_provider
+            if power_curves_data_provider
+            else PowerCurvesDataProvider(cfg, database_service)
+        )
+
+    def fill_database_with_power_curves(self):
+        """
+        Save the power curves from the data folder to the database.
+        """
+        self.power_curves_data_provider.save_power_curves_to_database()
+
+    def load_power_curves_from_database(self) -> pd.DataFrame:
+        """
+        Load the power curves from the database.
+
+        @return: The power curves DataFrame.
+        """
+        return self.power_curves_data_provider.load_from_database()
 
     def create_dataset(self):
 
