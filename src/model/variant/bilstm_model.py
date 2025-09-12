@@ -138,6 +138,11 @@ class BiLSTMModel(ModelInterface):
         num_epochs: int = 10,
         num_workers: int = 0,
         device: str | None = None,
+        val_split: float = 0.0,
+        early_stopping_patience: int = 0,
+        early_stopping_min_delta: float = 0.0,
+        restore_best_weights: bool = True,
+        shuffle_train: bool = True,
     ) -> None:
         self.cfg = cfg
         self.history_steps = history_steps
@@ -151,6 +156,11 @@ class BiLSTMModel(ModelInterface):
         self.num_epochs = num_epochs
         self.num_workers = num_workers
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.val_split = float(val_split)
+        self.early_stopping_patience = int(early_stopping_patience)
+        self.early_stopping_min_delta = float(early_stopping_min_delta)
+        self.restore_best_weights = bool(restore_best_weights)
+        self.shuffle_train = bool(shuffle_train)
 
         # Will be initialized during training/loading
         self._model: _BiLSTMHead | None = None
@@ -163,16 +173,25 @@ class BiLSTMModel(ModelInterface):
     # ------------- Public API -------------
     def train(self, dataset: pd.DataFrame) -> None:
         df = self._prepare_dataframe(dataset)
-        sequences, num_stations = self._build_sequences(df)
+        train_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
+        val_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
+        if self.val_split and self.val_split > 0.0:
+            train_sequences, val_sequences, num_stations = self._build_sequences_train_val(
+                df, self.val_split
+            )
+        else:
+            sequences, num_stations = self._build_sequences(df)
+            train_sequences = sequences
+            val_sequences = []
 
-        if len(sequences) == 0:
+        if len(train_sequences) == 0:
             raise ValueError(
                 "No training sequences could be constructed. Ensure sufficient history per station."
             )
 
         feature_dim = len(self._feature_columns)
         logger.info(
-            f"Preparing training: sequences={len(sequences)}, stations={num_stations}, "
+            f"Preparing training: train_sequences={len(train_sequences)}, val_sequences={len(val_sequences)}, stations={num_stations}, "
             f"feature_dim={feature_dim}, device={self.device}"
         )
         self._model = _BiLSTMHead(
@@ -192,18 +211,28 @@ class BiLSTMModel(ModelInterface):
             f"dropout={self.dropout}, params={trainable_params:,}"
         )
 
-        train_ds = _SequenceDataset(sequences)
+        train_ds = _SequenceDataset(train_sequences)
         train_loader = DataLoader(
             train_ds,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=self.shuffle_train,
             num_workers=self.num_workers,
             pin_memory=(self.device == "cuda"),
         )
+        val_loader: DataLoader | None = None
+        if len(val_sequences) > 0:
+            val_ds = _SequenceDataset(val_sequences)
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=(self.device == "cuda"),
+            )
 
         num_batches = len(train_loader)
         logger.info(
-            f"DataLoader ready: samples={len(train_ds)}, batch_size={self.batch_size}, batches_per_epoch={num_batches}"
+            f"DataLoader ready: train_samples={len(train_ds)}, val_samples={(len(val_sequences) if val_loader is not None else 0)}, batch_size={self.batch_size}, batches_per_epoch={num_batches}"
         )
         if self.device == "cuda" and torch.cuda.is_available():
             try:
@@ -214,6 +243,10 @@ class BiLSTMModel(ModelInterface):
 
         optimizer = torch.optim.Adam(self._model.parameters(), lr=self.learning_rate)
         loss_fn = nn.MSELoss()
+
+        best_val_loss = float("inf")
+        best_state_dict: Dict[str, torch.Tensor] | None = None
+        epochs_no_improve = 0
 
         self._model.train()
         for epoch in range(self.num_epochs):
@@ -246,6 +279,45 @@ class BiLSTMModel(ModelInterface):
             logger.info(
                 f"BiLSTM epoch {epoch + 1}/{self.num_epochs} - loss={epoch_loss:.6f}"
             )
+
+            # Validation and early stopping
+            if val_loader is not None:
+                self._model.eval()
+                val_total = 0.0
+                val_count = 0
+                with torch.no_grad():
+                    for xb, yb, sb in val_loader:
+                        non_block = self.device == "cuda"
+                        xb = xb.to(self.device, non_blocking=non_block)
+                        yb = yb.to(self.device, non_blocking=non_block)
+                        sb = sb.to(self.device, non_blocking=non_block)
+                        preds = self._model(xb, sb)
+                        vloss = loss_fn(preds, yb)
+                        val_total += float(vloss.detach().cpu().item()) * xb.size(0)
+                        val_count += xb.size(0)
+                val_loss = val_total / max(1, val_count)
+                logger.info(
+                    f"BiLSTM epoch {epoch + 1}/{self.num_epochs} - val_loss={val_loss:.6f}"
+                )
+
+                improved = (best_val_loss - val_loss) > self.early_stopping_min_delta
+                if improved:
+                    best_val_loss = val_loss
+                    # Deep copy state dict to CPU tensors
+                    best_state_dict = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if self.early_stopping_patience > 0 and epochs_no_improve >= self.early_stopping_patience:
+                        logger.info(
+                            f"Early stopping triggered at epoch {epoch + 1}: no improvement in {self.early_stopping_patience} epoch(s)."
+                        )
+                        break
+                self._model.train()
+
+        # Optionally restore best weights
+        if best_state_dict is not None and self.restore_best_weights:
+            self._model.load_state_dict(best_state_dict)
 
     def predict(self, dataset: pd.DataFrame) -> pd.DataFrame:
         if self._model is None:
@@ -608,6 +680,15 @@ class BiLSTMModel(ModelInterface):
             "hidden_size": self.hidden_size,
             "num_layers": self.num_layers,
             "dropout": self.dropout,
+            "val_split": self.val_split,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
+            "restore_best_weights": self.restore_best_weights,
+            "batch_size": self.batch_size,
+            "learning_rate": self.learning_rate,
+            "num_epochs": self.num_epochs,
+            "num_workers": self.num_workers,
+            "shuffle_train": self.shuffle_train,
             "feature_columns": self._feature_columns,
             "target_columns": self._target_columns,
             "station_id_to_index": self._station_id_to_index,
@@ -629,6 +710,15 @@ class BiLSTMModel(ModelInterface):
         self.hidden_size = int(metadata["hidden_size"])
         self.num_layers = int(metadata["num_layers"])
         self.dropout = float(metadata["dropout"])
+        self.val_split = float(metadata.get("val_split", 0.0))
+        self.early_stopping_patience = int(metadata.get("early_stopping_patience", 0))
+        self.early_stopping_min_delta = float(metadata.get("early_stopping_min_delta", 0.0))
+        self.restore_best_weights = bool(metadata.get("restore_best_weights", True))
+        self.batch_size = int(metadata.get("batch_size", self.batch_size))
+        self.learning_rate = float(metadata.get("learning_rate", self.learning_rate))
+        self.num_epochs = int(metadata.get("num_epochs", self.num_epochs))
+        self.num_workers = int(metadata.get("num_workers", self.num_workers))
+        self.shuffle_train = bool(metadata.get("shuffle_train", self.shuffle_train))
         self._feature_columns = list(metadata["feature_columns"])  # type: ignore[arg-type]
         self._target_columns = list(metadata["target_columns"])  # type: ignore[arg-type]
         self._station_id_to_index = dict(metadata["station_id_to_index"])  # type: ignore[arg-type]
@@ -783,3 +873,61 @@ class BiLSTMModel(ModelInterface):
             len(self._station_id_to_index) if self._station_id_to_index else 0
         )
         return sequences, station_count
+
+    def _build_sequences_train_val(
+        self,
+        df: pd.DataFrame,
+        val_fraction: float,
+    ) -> Tuple[
+        List[Tuple[np.ndarray, np.ndarray, int]],
+        List[Tuple[np.ndarray, np.ndarray, int]],
+        int,
+    ]:
+        """
+        Build time-aware train/validation sequences ensuring no target leakage across the split.
+
+        For each station, a cutoff index is chosen based on val_fraction. Training targets are strictly
+        before the cutoff; validation targets are at or after the cutoff. History windows for validation
+        samples may overlap the training region, which reflects real-world forecasting usage.
+        """
+        train_sequences: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        val_sequences: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        hist = self.history_steps
+        horiz = self.horizon_steps
+
+        for station_id, g in df.groupby("station_id", sort=False):
+            g = g.sort_values("record_date")
+            features = g[self._feature_columns].to_numpy(dtype=float)
+            targets = g[["u", "v"]].to_numpy(dtype=float)
+            n = len(g)
+            if n < hist + horiz:
+                continue
+            sid_idx = self._station_id_to_index[str(station_id)]  # type: ignore[index]
+
+            cut = int(np.floor(n * (1.0 - float(val_fraction))))
+            cut = int(np.clip(cut, 0, n))
+
+            # Training sequences: targets entirely before cut
+            max_train_start = cut - hist - horiz
+            if max_train_start >= 0:
+                for start in range(0, max_train_start + 1):
+                    x = features[start : start + hist]
+                    y = targets[start + hist : start + hist + horiz]
+                    train_sequences.append((x, y, sid_idx))
+
+            # Validation sequences: targets start at or after cut
+            min_val_start = max(0, cut - hist)
+            max_val_start = n - hist - horiz
+            if max_val_start >= min_val_start:
+                for start in range(min_val_start, max_val_start + 1):
+                    # Ensure first target index is >= cut
+                    if start + hist < cut:
+                        continue
+                    x = features[start : start + hist]
+                    y = targets[start + hist : start + hist + horiz]
+                    val_sequences.append((x, y, sid_idx))
+
+        station_count = (
+            len(self._station_id_to_index) if self._station_id_to_index else 0
+        )
+        return train_sequences, val_sequences, station_count
