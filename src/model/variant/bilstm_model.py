@@ -171,6 +171,10 @@ class BiLSTMModel(ModelInterface):
             )
 
         feature_dim = len(self._feature_columns)
+        logger.info(
+            f"Preparing training: sequences={len(sequences)}, stations={num_stations}, "
+            f"feature_dim={feature_dim}, device={self.device}"
+        )
         self._model = _BiLSTMHead(
             input_dim=feature_dim,
             hidden_size=self.hidden_size,
@@ -181,6 +185,13 @@ class BiLSTMModel(ModelInterface):
             station_embedding_dim=self.station_embedding_dim,
         ).to(self.device)
 
+        # Log model parameter count
+        trainable_params = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        logger.info(
+            f"Model initialized: hidden_size={self.hidden_size}, num_layers={self.num_layers}, "
+            f"dropout={self.dropout}, params={trainable_params:,}"
+        )
+
         train_ds = _SequenceDataset(sequences)
         train_loader = DataLoader(
             train_ds,
@@ -190,16 +201,33 @@ class BiLSTMModel(ModelInterface):
             pin_memory=(self.device == "cuda"),
         )
 
+        num_batches = len(train_loader)
+        logger.info(
+            f"DataLoader ready: samples={len(train_ds)}, batch_size={self.batch_size}, batches_per_epoch={num_batches}"
+        )
+        if self.device == "cuda" and torch.cuda.is_available():
+            try:
+                device_name = torch.cuda.get_device_name(0)
+                logger.info(f"CUDA available: using GPU '{device_name}'")
+            except Exception:
+                logger.info("CUDA available: using GPU")
+
         optimizer = torch.optim.Adam(self._model.parameters(), lr=self.learning_rate)
         loss_fn = nn.MSELoss()
 
         self._model.train()
         for epoch in range(self.num_epochs):
+            logger.info(
+                f"Epoch {epoch + 1}/{self.num_epochs} starting (lr={optimizer.param_groups[0]['lr']:.3e})"
+            )
             epoch_loss = 0.0
-            for xb, yb, sb in train_loader:
-                xb = xb.to(self.device)
-                yb = yb.to(self.device)
-                sb = sb.to(self.device)
+            # Log ~10 times per epoch
+            log_every = max(1, num_batches // 10) if num_batches > 0 else 1
+            for batch_idx, (xb, yb, sb) in enumerate(train_loader, start=1):
+                non_block = self.device == "cuda"
+                xb = xb.to(self.device, non_blocking=non_block)
+                yb = yb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
 
                 optimizer.zero_grad(set_to_none=True)
                 preds = self._model(xb, sb)
@@ -208,6 +236,11 @@ class BiLSTMModel(ModelInterface):
                 optimizer.step()
 
                 epoch_loss += float(loss.detach().cpu().item()) * xb.size(0)
+
+                if batch_idx % log_every == 0 or batch_idx == num_batches:
+                    logger.info(
+                        f"Epoch {epoch + 1} [{batch_idx}/{num_batches}] batch_loss={loss.item():.6f}"
+                    )
 
             epoch_loss /= len(train_ds)
             logger.info(
@@ -230,14 +263,21 @@ class BiLSTMModel(ModelInterface):
                 continue
 
             hist = g.tail(self.history_steps)
-            x = hist[self._feature_columns].to_numpy(dtype=float)
-            x = torch.from_numpy(x).unsqueeze(0).float().to(self.device)
+            x_np = hist[self._feature_columns].to_numpy(dtype=float)
+            non_block = self.device == "cuda" and torch.cuda.is_available()
+            x_t = torch.from_numpy(x_np).float()
+            if non_block:
+                x_t = x_t.pin_memory()
+            x = x_t.unsqueeze(0).to(self.device, non_blocking=non_block)
 
             # Map station to known index; fallback to 0 for unseen stations
             mapped_idx = 0
             if self._station_id_to_index is not None:
                 mapped_idx = int(self._station_id_to_index.get(str(station_id), 0))
-            sid_idx = torch.tensor([mapped_idx], dtype=torch.long, device=self.device)
+            sid_cpu = torch.tensor([mapped_idx], dtype=torch.long)
+            if non_block:
+                sid_cpu = sid_cpu.pin_memory()
+            sid_idx = sid_cpu.to(self.device, non_blocking=non_block)
 
             self._model.eval()
             with torch.no_grad():
@@ -266,6 +306,294 @@ class BiLSTMModel(ModelInterface):
             raise ValueError("No stations had sufficient history for prediction.")
 
         return pd.concat(results, axis=0).reset_index(drop=True)
+
+    def evaluate(self, dataset: pd.DataFrame, max_batches: int | None = None) -> Dict[str, float]:
+        if self._model is None:
+            raise ValueError(
+                "Model not trained. Call train() first or load a saved model."
+            )
+
+        if self._feature_scaler is None or self._target_scaler is None:
+            raise ValueError("Scalers not available. Train or load a model with scalers.")
+
+        df = self._prepare_dataframe(dataset, fit_scalers=False)
+        sequences, _ = self._build_sequences(df)
+        if len(sequences) == 0:
+            raise ValueError(
+                "No evaluation sequences could be constructed. Ensure sufficient history per station."
+            )
+
+        eval_ds = _SequenceDataset(sequences)
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+
+        num_batches = len(eval_loader)
+        logger.info(
+            f"Evaluation: samples={len(eval_ds)}, batch_size={self.batch_size}, batches={num_batches}"
+        )
+
+        self._model.eval()
+        non_block = self.device == "cuda" and torch.cuda.is_available()
+
+        preds_u: List[np.ndarray] = []
+        preds_v: List[np.ndarray] = []
+        trues_u: List[np.ndarray] = []
+        trues_v: List[np.ndarray] = []
+
+        with torch.no_grad():
+            for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
+                xb = xb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
+
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 2]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 2]
+
+                # Inverse scale
+                B, H, _ = y_pred_scaled.shape
+                y_pred_flat = y_pred_scaled.reshape(-1, 2)
+                y_true_flat = y_true_scaled.reshape(-1, 2)
+                y_pred = self._target_scaler.inverse_transform(y_pred_flat).reshape(B, H, 2)
+                y_true = self._target_scaler.inverse_transform(y_true_flat).reshape(B, H, 2)
+
+                preds_u.append(y_pred[:, :, 0].reshape(-1))
+                preds_v.append(y_pred[:, :, 1].reshape(-1))
+                trues_u.append(y_true[:, :, 0].reshape(-1))
+                trues_v.append(y_true[:, :, 1].reshape(-1))
+
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+        u_pred = np.concatenate(preds_u)
+        v_pred = np.concatenate(preds_v)
+        u_true = np.concatenate(trues_u)
+        v_true = np.concatenate(trues_v)
+
+        # Basic metrics for u, v
+        mae_u = float(np.mean(np.abs(u_pred - u_true)))
+        rmse_u = float(np.sqrt(np.mean((u_pred - u_true) ** 2)))
+        mae_v = float(np.mean(np.abs(v_pred - v_true)))
+        rmse_v = float(np.sqrt(np.mean((v_pred - v_true) ** 2)))
+
+        # Derived speed metrics
+        speed_pred = np.sqrt(u_pred**2 + v_pred**2)
+        speed_true = np.sqrt(u_true**2 + v_true**2)
+        mae_speed = float(np.mean(np.abs(speed_pred - speed_true)))
+        rmse_speed = float(np.sqrt(np.mean((speed_pred - speed_true) ** 2)))
+
+        # Direction error (meteorological coming-from): dir = atan2(-u, -v) in degrees [0, 360)
+        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
+            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
+            ang = np.mod(ang, 360.0)
+            return ang
+
+        def angular_mae_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
+            # Minimal absolute angular difference on the circle
+            diff = np.abs(((a_deg - b_deg + 180.0) % 360.0) - 180.0)
+            return float(np.mean(diff))
+
+        dir_pred = uv_to_dir_deg(u_pred, v_pred)
+        dir_true = uv_to_dir_deg(u_true, v_true)
+        mae_dir_deg = angular_mae_deg(dir_pred, dir_true)
+
+        metrics = {
+            "mae_u": mae_u,
+            "rmse_u": rmse_u,
+            "mae_v": mae_v,
+            "rmse_v": rmse_v,
+            "mae_speed": mae_speed,
+            "rmse_speed": rmse_speed,
+            "mae_direction_deg": mae_dir_deg,
+        }
+
+        logger.info(
+            "Evaluation metrics: "
+            + ", ".join(
+                [
+                    f"mae_u={mae_u:.4f}",
+                    f"rmse_u={rmse_u:.4f}",
+                    f"mae_v={mae_v:.4f}",
+                    f"rmse_v={rmse_v:.4f}",
+                    f"mae_speed={mae_speed:.4f}",
+                    f"rmse_speed={rmse_speed:.4f}",
+                    f"mae_direction_deg={mae_dir_deg:.2f}°",
+                ]
+            )
+        )
+
+        return metrics
+
+    def evaluate_per_horizon(
+        self,
+        dataset: pd.DataFrame,
+        save_dir: str | None = None,
+        max_batches: int | None = None,
+    ) -> Dict[str, List[float]]:
+        if self._model is None:
+            raise ValueError(
+                "Model not trained. Call train() first or load a saved model."
+            )
+
+        if self._feature_scaler is None or self._target_scaler is None:
+            raise ValueError("Scalers not available. Train or load a model with scalers.")
+
+        df = self._prepare_dataframe(dataset, fit_scalers=False)
+        sequences, _ = self._build_sequences(df)
+        if len(sequences) == 0:
+            raise ValueError(
+                "No evaluation sequences could be constructed. Ensure sufficient history per station."
+            )
+
+        eval_ds = _SequenceDataset(sequences)
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+
+        H = self.horizon_steps
+        sum_abs_u = np.zeros(H, dtype=float)
+        sum_sq_u = np.zeros(H, dtype=float)
+        sum_abs_v = np.zeros(H, dtype=float)
+        sum_sq_v = np.zeros(H, dtype=float)
+        sum_abs_speed = np.zeros(H, dtype=float)
+        sum_sq_speed = np.zeros(H, dtype=float)
+        sum_abs_dir = np.zeros(H, dtype=float)
+        count = np.zeros(H, dtype=float)
+
+        self._model.eval()
+        non_block = self.device == "cuda" and torch.cuda.is_available()
+
+        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
+            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
+            return np.mod(ang, 360.0)
+
+        with torch.no_grad():
+            for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
+                xb = xb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
+
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 2]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 2]
+
+                B, H_, _ = y_pred_scaled.shape
+                assert H_ == H
+
+                # Inverse scale
+                y_pred = self._target_scaler.inverse_transform(
+                    y_pred_scaled.reshape(-1, 2)
+                ).reshape(B, H, 2)
+                y_true = self._target_scaler.inverse_transform(
+                    y_true_scaled.reshape(-1, 2)
+                ).reshape(B, H, 2)
+
+                u_p = y_pred[:, :, 0]
+                v_p = y_pred[:, :, 1]
+                u_t = y_true[:, :, 0]
+                v_t = y_true[:, :, 1]
+
+                # u, v errors
+                abs_u = np.abs(u_p - u_t).sum(axis=0)
+                sq_u = ((u_p - u_t) ** 2).sum(axis=0)
+                abs_v = np.abs(v_p - v_t).sum(axis=0)
+                sq_v = ((v_p - v_t) ** 2).sum(axis=0)
+
+                # speed errors
+                sp_p = np.sqrt(u_p**2 + v_p**2)
+                sp_t = np.sqrt(u_t**2 + v_t**2)
+                abs_sp = np.abs(sp_p - sp_t).sum(axis=0)
+                sq_sp = ((sp_p - sp_t) ** 2).sum(axis=0)
+
+                # direction absolute error (degrees) with circular difference
+                dir_p = uv_to_dir_deg(u_p, v_p)
+                dir_t = uv_to_dir_deg(u_t, v_t)
+                diff_dir = np.abs(((dir_p - dir_t + 180.0) % 360.0) - 180.0).sum(axis=0)
+
+                sum_abs_u += abs_u
+                sum_sq_u += sq_u
+                sum_abs_v += abs_v
+                sum_sq_v += sq_v
+                sum_abs_speed += abs_sp
+                sum_sq_speed += sq_sp
+                sum_abs_dir += diff_dir
+                count += float(B)
+
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+        # Avoid division by zero
+        count = np.maximum(count, 1.0)
+
+        mae_u = (sum_abs_u / count).tolist()
+        rmse_u = np.sqrt(sum_sq_u / count).tolist()
+        mae_v = (sum_abs_v / count).tolist()
+        rmse_v = np.sqrt(sum_sq_v / count).tolist()
+        mae_speed = (sum_abs_speed / count).tolist()
+        rmse_speed = np.sqrt(sum_sq_speed / count).tolist()
+        mae_direction_deg = (sum_abs_dir / count).tolist()
+
+        metrics: Dict[str, List[float]] = {
+            "mae_u": mae_u,
+            "rmse_u": rmse_u,
+            "mae_v": mae_v,
+            "rmse_v": rmse_v,
+            "mae_speed": mae_speed,
+            "rmse_speed": rmse_speed,
+            "mae_direction_deg": mae_direction_deg,
+        }
+
+        logger.info("Computed per-horizon metrics for 1..%d steps", H)
+
+        # Optional plotting
+        if save_dir is not None:
+            try:
+                import importlib
+                os.makedirs(save_dir, exist_ok=True)
+                plt = importlib.import_module("matplotlib.pyplot")
+                horizons = np.arange(1, H + 1)
+
+                # Plot u, v, speed MAE/RMSE
+                fig1 = plt.figure(figsize=(10, 6))
+                plt.plot(horizons, mae_u, label="MAE u")
+                plt.plot(horizons, rmse_u, label="RMSE u")
+                plt.plot(horizons, mae_v, label="MAE v")
+                plt.plot(horizons, rmse_v, label="RMSE v")
+                plt.plot(horizons, mae_speed, label="MAE speed")
+                plt.plot(horizons, rmse_speed, label="RMSE speed")
+                plt.xlabel("Horizon (steps, 10-min)")
+                plt.ylabel("Error")
+                plt.title("Per-horizon errors: u, v, speed")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                fig1.tight_layout()
+                fig1.savefig(os.path.join(save_dir, "per_horizon_uv_speed.png"), dpi=150)
+                plt.close(fig1)
+
+                # Plot direction MAE
+                fig2 = plt.figure(figsize=(10, 4))
+                plt.plot(horizons, mae_direction_deg, label="MAE direction (deg)")
+                plt.xlabel("Horizon (steps, 10-min)")
+                plt.ylabel("Degrees")
+                plt.title("Per-horizon direction error")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                fig2.tight_layout()
+                fig2.savefig(os.path.join(save_dir, "per_horizon_direction.png"), dpi=150)
+                plt.close(fig2)
+
+                logger.info(
+                    f"Saved per-horizon plots to {os.path.abspath(save_dir)}"
+                )
+            except Exception as e:
+                logger.warning(f"Could not generate plots: {e}")
+
+        return metrics
 
     def save(self, path: str) -> None:
         if self._model is None:
@@ -380,13 +708,11 @@ class BiLSTMModel(ModelInterface):
         df = df.sort_values(["station_id", "record_date"]).reset_index(drop=True)
 
         # Impute missing values within each station by forward/backward fill, then global fill
-        def _impute_station(g: pd.DataFrame) -> pd.DataFrame:
-            g = g.copy()
-            g[numeric_cols] = g[numeric_cols].ffill().bfill()
-            return g
-
-        df = df.groupby("station_id", sort=False, group_keys=False).apply(
-            _impute_station
+        # Use column selection in groupby to avoid FutureWarning and ensure grouping col is excluded
+        df[numeric_cols] = (
+            df.groupby("station_id", sort=False)[numeric_cols]
+            .apply(lambda g: g.ffill().bfill())
+            .reset_index(level=0, drop=True)
         )
         df[numeric_cols] = df[numeric_cols].fillna(
             df[numeric_cols].mean(numeric_only=True)
