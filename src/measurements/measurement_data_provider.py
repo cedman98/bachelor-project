@@ -15,6 +15,10 @@ from src.database.database_service import DatabaseService
 
 from hamilton import driver as h_driver
 from src.measurements import measurement_preprocess as mp
+from sqlalchemy import func
+from sqlalchemy import distinct, literal_column
+from sqlalchemy import select as sa_select
+from sqlalchemy import text
 
 
 class MeasurementDataProvider:
@@ -205,46 +209,17 @@ class MeasurementDataProvider:
                     )
                     time.sleep(sleep_s)
 
-    def load_measurements_from_database_for_datetime(
-        self, weather_stations: pd.DataFrame, datetime: datetime
-    ) -> pd.DataFrame:
+    def load_measurements_from_database(self, query) -> pd.DataFrame:
         """
-        Load the measurements from the database for a specific datetime.
-        @param datetime: The datetime.
-        @return: The measurements DataFrame.
+        Execute a SQLAlchemy query and stream results into a pandas DataFrame.
+        @param query: SQLAlchemy selectable query to execute.
+        @return: DataFrame with all rows returned by the query.
         """
-        table = WindStationMeasurements.__table__
-        query = (
-            select(table)
-            .where(table.c.record_date == datetime)
-            .where(
-                table.c.station_id.in_(weather_stations["weather_station_id"].tolist())
-            )
+        chunk_size = getattr(
+            getattr(self.cfg, "database", object()),
+            "measurement_select_chunk_size",
+            1_000_000,
         )
-
-        with Session(self.database_service.engine) as session:
-            rows = session.execute(query).mappings().all()
-            df = pd.DataFrame(rows)
-            logger.info(
-                f"Loaded {len(df)} measurements from database for datetime {datetime}"
-            )
-
-            # Drop rows where average_wind_direction or average_wind_speed is -999
-            df = df[
-                (df["average_wind_direction"] != -999)
-                & (df["average_wind_speed"] != -999)
-            ]
-
-            return df
-
-    def load_all_measurements_from_database(self) -> pd.DataFrame:
-        """
-        Load all measurements from the database.
-        @return: The measurements DataFrame.
-        """
-        table = WindStationMeasurements.__table__
-        query = select(table)
-        chunk_size = 1_000_000
 
         dataframes: list[pd.DataFrame] = []
         total_loaded = 0
@@ -273,6 +248,69 @@ class MeasurementDataProvider:
 
         logger.info(f"Loaded {len(df)} measurements from database")
         return df
+
+    def load_measurements_from_database_for_datetime(
+        self, weather_stations: pd.DataFrame, datetime: datetime
+    ) -> pd.DataFrame:
+        """
+        Load the measurements from the database for a specific datetime.
+        @param datetime: The datetime.
+        @return: The measurements DataFrame.
+        """
+        table = WindStationMeasurements.__table__
+        query = (
+            select(table)
+            .where(table.c.record_date == datetime)
+            .where(
+                table.c.station_id.in_(weather_stations["weather_station_id"].tolist())
+            )
+        )
+
+        df = self.load_measurements_from_database(query)
+        logger.info(
+            f"Loaded {len(df)} measurements from database for datetime {datetime}"
+        )
+
+        # Drop rows where average_wind_direction or average_wind_speed is -999
+        df = df[
+            (df["average_wind_direction"] != -999) & (df["average_wind_speed"] != -999)
+        ]
+
+        return df
+
+    def load_all_measurements_from_database(self) -> pd.DataFrame:
+        """
+        Load all measurements from the database.
+        @return: The measurements DataFrame.
+        """
+        table = WindStationMeasurements.__table__
+        query = select(table)
+        return self.load_measurements_from_database(query)
+
+    def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
+        """
+        Load the last 72 measurements per station using an efficient per-station LIMIT.
+        Uses a LATERAL join so the DB can leverage the (station_id, record_date DESC) index.
+        @return: The measurements DataFrame.
+        """
+
+        query = text(
+            """
+            SELECT m.*
+            FROM (
+                SELECT DISTINCT station_id FROM wind_station_measurements
+            ) s
+            CROSS JOIN LATERAL (
+                SELECT *
+                FROM wind_station_measurements m
+                WHERE m.station_id = s.station_id
+                ORDER BY m.record_date DESC
+                LIMIT 72
+            ) m
+            """
+        )
+
+        return self.load_measurements_from_database(query)
 
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False, dataset: str = "wind"

@@ -69,6 +69,11 @@ class ModelService:
     def attach_model(self, model: ModelInterface) -> None:
         self.model = model
 
+    def predict(self, dataset: pd.DataFrame) -> pd.DataFrame:
+        if self.model is None:
+            raise ValueError("Model not attached. Call attach_model(model) first.")
+        return self.model.predict(dataset)
+
     def train_model(self, save_path: str | None = None) -> None:
         if self.dataset is None:
             raise ValueError("Dataset not loaded. Call load_dataset() first.")

@@ -36,6 +36,7 @@ class WindStationMeasurements(Base):
     __tablename__ = "wind_station_measurements"
     __table_args__ = (
         UniqueConstraint("station_id", "record_date", name="uix_station_date"),
+        Index("ix_wsm_station_date_desc", "station_id", "record_date"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -53,6 +54,23 @@ class WindStationMeasurements(Base):
     precipitation_duration: Mapped[float] = mapped_column(Float)
     sum_precipitation_height: Mapped[float] = mapped_column(Float)
     precipitation_indicator: Mapped[int] = mapped_column(Integer)
+    record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
+
+
+class WindStationMeasurementsPrediction(Base):
+    __tablename__ = "wind_station_measurements_prediction"
+    __table_args__ = (
+        UniqueConstraint(
+            "station_id", "record_date", name="uix_station_date_prediction"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    station_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("weather_stations.weather_station_id"), index=True
+    )
+    u_pred: Mapped[float] = mapped_column(Float)
+    v_pred: Mapped[float] = mapped_column(Float)
     record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 

@@ -87,6 +87,10 @@ class MeasurementService:
     def load_measurements_from_database_for_datetime(
         self, datetime: datetime
     ) -> pd.DataFrame:
+        """
+        @param datetime: The datetime.
+        @return: The measurements DataFrame.
+        """
         if self.weather_stations is None:
             raise ValueError(
                 "No weather stations loaded. Please load the weather stations first."
@@ -108,3 +112,13 @@ class MeasurementService:
         @return: The measurements DataFrame.
         """
         return self.measurement_data_provider.load_all_measurements_from_database()
+
+    def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
+        """
+        The function loads for all stations the last 72 measurements.
+        @return: The measurements DataFrame.
+        """
+        logger.info(f"Loading all recent measurements from database")
+        df = self.measurement_data_provider.load_all_recent_measurements_from_database()
+        logger.info(f"Loaded {len(df)} recent measurements from database")
+        return df
