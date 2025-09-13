@@ -69,8 +69,8 @@ class WindStationMeasurementsPrediction(Base):
     station_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("weather_stations.weather_station_id"), index=True
     )
-    u_pred: Mapped[float] = mapped_column(Float)
-    v_pred: Mapped[float] = mapped_column(Float)
+    u: Mapped[float] = mapped_column(Float)
+    v: Mapped[float] = mapped_column(Float)
     record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 

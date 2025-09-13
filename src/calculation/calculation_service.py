@@ -60,7 +60,6 @@ class CalculationService:
         return self.power_curves_data_provider.load_from_database()
 
     def create_dataset(self):
-
         test_datetime = datetime(2025, 9, 4, 10, 0)
         measurements_df = (
             self.measurement_service.load_measurements_from_database_for_datetime(
@@ -78,3 +77,31 @@ class CalculationService:
         logger.info(f"Wind speed: {wind_speed}, Wind direction: {wind_direction}")
 
         return measurements_df
+
+    def extrapolate_u_and_v_to_all_wind_turbines(
+        self, measurements_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Extrapolate u and v to all wind turbines for all intervals.
+        @param measurements_df: The measurements DataFrame.
+        @return: The extrapolated u and v DataFrame.
+        """
+
+        wind_turbines_df = self.wind_turbines[
+            [
+                "unit_mastr_number",
+                "latitude",
+                "longitude",
+                "manufacturer",
+                "type_designation",
+                "hub_height",
+            ]
+        ]
+
+        weather_stations_df = self.weather_stations[
+            ["weather_station_id", "latitude", "longitude", "height"]
+        ]
+
+        return self.wind_calculation_data_provider.extrapolate_u_and_v_to_all_wind_turbines(
+            wind_turbines_df, weather_stations_df, measurements_df
+        )

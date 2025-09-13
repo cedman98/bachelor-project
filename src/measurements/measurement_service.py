@@ -122,3 +122,22 @@ class MeasurementService:
         df = self.measurement_data_provider.load_all_recent_measurements_from_database()
         logger.info(f"Loaded {len(df)} recent measurements from database")
         return df
+
+    def transform_measurements_to_prediction_format(
+        self, df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Transform the measurements to the prediction format.
+        @param df: The measurements DataFrame.
+        @return: The measurements DataFrame in the prediction format.
+        """
+        import numpy as np
+
+        # Convert wind direction from degrees to radians
+        direction_rad = np.deg2rad(df["average_wind_direction"])
+
+        # Calculate u and v components using meteorological convention
+        df["u"] = -df["average_wind_speed"] * np.sin(direction_rad)
+        df["v"] = -df["average_wind_speed"] * np.cos(direction_rad)
+
+        return df[["station_id", "record_date", "u", "v"]]

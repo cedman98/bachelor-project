@@ -35,7 +35,7 @@ class PredictionService:
             else PredictionDataProvider(cfg, database_service)
         )
 
-    def predict_measurements(self) -> pd.DataFrame:
+    def predict_measurements(self, upsert_to_database: bool = True) -> pd.DataFrame:
         # 1. Load the last 72 measurements for each station
         measurements_df = (
             self.measurement_service.load_all_recent_measurements_from_database()
@@ -43,9 +43,22 @@ class PredictionService:
         # 2. Predict the measurements
         predictions_df = self.model_service.predict(measurements_df)
         # 3. Save the predictions to the database
-        self.prediction_data_provider.save_predictions_to_database(predictions_df)
-        # 4. Return the predictions
-        return predictions_df
+        if upsert_to_database:
+            self.prediction_data_provider.save_predictions_to_database(predictions_df)
+        # 4. Transform the measurements to the prediction format
+        measurements_df = (
+            self.measurement_service.transform_measurements_to_prediction_format(
+                measurements_df
+            )
+        )
+        # 5. Concate the measurements and predictions, but add a column to identify the predictions
+        predictions_df["is_prediction"] = True
+        measurements_df["is_prediction"] = False
+        combined_df = pd.concat([measurements_df, predictions_df])
+        combined_df = combined_df.sort_values(by=["record_date", "station_id"])
+
+        # 5. Return the predictions
+        return combined_df
 
     def predict(self, dataset: pd.DataFrame) -> pd.DataFrame:
         pass
