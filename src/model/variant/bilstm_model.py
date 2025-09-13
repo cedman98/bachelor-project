@@ -155,7 +155,16 @@ class BiLSTMModel(ModelInterface):
         self.learning_rate = learning_rate
         self.num_epochs = num_epochs
         self.num_workers = num_workers
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # Auto-detect best available device: CUDA > MPS > CPU
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
         self.val_split = float(val_split)
         self.early_stopping_patience = int(early_stopping_patience)
         self.early_stopping_min_delta = float(early_stopping_min_delta)
@@ -176,8 +185,8 @@ class BiLSTMModel(ModelInterface):
         train_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
         val_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
         if self.val_split and self.val_split > 0.0:
-            train_sequences, val_sequences, num_stations = self._build_sequences_train_val(
-                df, self.val_split
+            train_sequences, val_sequences, num_stations = (
+                self._build_sequences_train_val(df, self.val_split)
             )
         else:
             sequences, num_stations = self._build_sequences(df)
@@ -205,7 +214,9 @@ class BiLSTMModel(ModelInterface):
         ).to(self.device)
 
         # Log model parameter count
-        trainable_params = sum(p.numel() for p in self._model.parameters() if p.requires_grad)
+        trainable_params = sum(
+            p.numel() for p in self._model.parameters() if p.requires_grad
+        )
         logger.info(
             f"Model initialized: hidden_size={self.hidden_size}, num_layers={self.num_layers}, "
             f"dropout={self.dropout}, params={trainable_params:,}"
@@ -240,6 +251,8 @@ class BiLSTMModel(ModelInterface):
                 logger.info(f"CUDA available: using GPU '{device_name}'")
             except Exception:
                 logger.info("CUDA available: using GPU")
+        elif self.device == "mps":
+            logger.info("MPS available: using Apple Silicon GPU")
 
         optimizer = torch.optim.Adam(self._model.parameters(), lr=self.learning_rate)
         loss_fn = nn.MSELoss()
@@ -257,6 +270,8 @@ class BiLSTMModel(ModelInterface):
             # Log ~10 times per epoch
             log_every = max(1, num_batches // 10) if num_batches > 0 else 1
             for batch_idx, (xb, yb, sb) in enumerate(train_loader, start=1):
+                # Use non_blocking transfers only for CUDA. On MPS, non_blocking and
+                # pin_memory can cause device mismatch errors.
                 non_block = self.device == "cuda"
                 xb = xb.to(self.device, non_blocking=non_block)
                 yb = yb.to(self.device, non_blocking=non_block)
@@ -304,11 +319,17 @@ class BiLSTMModel(ModelInterface):
                 if improved:
                     best_val_loss = val_loss
                     # Deep copy state dict to CPU tensors
-                    best_state_dict = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                    best_state_dict = {
+                        k: v.detach().cpu().clone()
+                        for k, v in self._model.state_dict().items()
+                    }
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
-                    if self.early_stopping_patience > 0 and epochs_no_improve >= self.early_stopping_patience:
+                    if (
+                        self.early_stopping_patience > 0
+                        and epochs_no_improve >= self.early_stopping_patience
+                    ):
                         logger.info(
                             f"Early stopping triggered at epoch {epoch + 1}: no improvement in {self.early_stopping_patience} epoch(s)."
                         )
@@ -336,6 +357,7 @@ class BiLSTMModel(ModelInterface):
 
             hist = g.tail(self.history_steps)
             x_np = hist[self._feature_columns].to_numpy(dtype=float)
+            # Only enable pinned memory + non_blocking for CUDA to avoid MPS issues
             non_block = self.device == "cuda" and torch.cuda.is_available()
             x_t = torch.from_numpy(x_np).float()
             if non_block:
@@ -379,14 +401,18 @@ class BiLSTMModel(ModelInterface):
 
         return pd.concat(results, axis=0).reset_index(drop=True)
 
-    def evaluate(self, dataset: pd.DataFrame, max_batches: int | None = None) -> Dict[str, float]:
+    def evaluate(
+        self, dataset: pd.DataFrame, max_batches: int | None = None
+    ) -> Dict[str, float]:
         if self._model is None:
             raise ValueError(
                 "Model not trained. Call train() first or load a saved model."
             )
 
         if self._feature_scaler is None or self._target_scaler is None:
-            raise ValueError("Scalers not available. Train or load a model with scalers.")
+            raise ValueError(
+                "Scalers not available. Train or load a model with scalers."
+            )
 
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         sequences, _ = self._build_sequences(df)
@@ -429,8 +455,12 @@ class BiLSTMModel(ModelInterface):
                 B, H, _ = y_pred_scaled.shape
                 y_pred_flat = y_pred_scaled.reshape(-1, 2)
                 y_true_flat = y_true_scaled.reshape(-1, 2)
-                y_pred = self._target_scaler.inverse_transform(y_pred_flat).reshape(B, H, 2)
-                y_true = self._target_scaler.inverse_transform(y_true_flat).reshape(B, H, 2)
+                y_pred = self._target_scaler.inverse_transform(y_pred_flat).reshape(
+                    B, H, 2
+                )
+                y_true = self._target_scaler.inverse_transform(y_true_flat).reshape(
+                    B, H, 2
+                )
 
                 preds_u.append(y_pred[:, :, 0].reshape(-1))
                 preds_v.append(y_pred[:, :, 1].reshape(-1))
@@ -511,7 +541,9 @@ class BiLSTMModel(ModelInterface):
             )
 
         if self._feature_scaler is None or self._target_scaler is None:
-            raise ValueError("Scalers not available. Train or load a model with scalers.")
+            raise ValueError(
+                "Scalers not available. Train or load a model with scalers."
+            )
 
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         sequences, _ = self._build_sequences(df)
@@ -626,6 +658,7 @@ class BiLSTMModel(ModelInterface):
         if save_dir is not None:
             try:
                 import importlib
+
                 os.makedirs(save_dir, exist_ok=True)
                 plt = importlib.import_module("matplotlib.pyplot")
                 horizons = np.arange(1, H + 1)
@@ -644,7 +677,9 @@ class BiLSTMModel(ModelInterface):
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 fig1.tight_layout()
-                fig1.savefig(os.path.join(save_dir, "per_horizon_uv_speed.png"), dpi=150)
+                fig1.savefig(
+                    os.path.join(save_dir, "per_horizon_uv_speed.png"), dpi=150
+                )
                 plt.close(fig1)
 
                 # Plot direction MAE
@@ -656,12 +691,12 @@ class BiLSTMModel(ModelInterface):
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 fig2.tight_layout()
-                fig2.savefig(os.path.join(save_dir, "per_horizon_direction.png"), dpi=150)
+                fig2.savefig(
+                    os.path.join(save_dir, "per_horizon_direction.png"), dpi=150
+                )
                 plt.close(fig2)
 
-                logger.info(
-                    f"Saved per-horizon plots to {os.path.abspath(save_dir)}"
-                )
+                logger.info(f"Saved per-horizon plots to {os.path.abspath(save_dir)}")
             except Exception as e:
                 logger.warning(f"Could not generate plots: {e}")
 
@@ -712,7 +747,9 @@ class BiLSTMModel(ModelInterface):
         self.dropout = float(metadata["dropout"])
         self.val_split = float(metadata.get("val_split", 0.0))
         self.early_stopping_patience = int(metadata.get("early_stopping_patience", 0))
-        self.early_stopping_min_delta = float(metadata.get("early_stopping_min_delta", 0.0))
+        self.early_stopping_min_delta = float(
+            metadata.get("early_stopping_min_delta", 0.0)
+        )
         self.restore_best_weights = bool(metadata.get("restore_best_weights", True))
         self.batch_size = int(metadata.get("batch_size", self.batch_size))
         self.learning_rate = float(metadata.get("learning_rate", self.learning_rate))
@@ -738,7 +775,9 @@ class BiLSTMModel(ModelInterface):
             station_count=station_count,
             station_embedding_dim=self.station_embedding_dim,
         ).to(self.device)
-        self._model.load_state_dict(torch.load(model_path, map_location=self.device))
+        # Load model with proper device mapping - handle GPU->CPU/MPS conversion
+        state_dict = torch.load(model_path, map_location=self.device)
+        self._model.load_state_dict(state_dict)
         self._model.eval()
 
     # ------------- Internal helpers -------------
