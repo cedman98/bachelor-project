@@ -1,0 +1,13 @@
+# Prevent host virtualenv from overwriting container env
+.venv
+
+# Common Python ignores
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS / VCS
+.DS_Store
+.git/
+.gitignore
