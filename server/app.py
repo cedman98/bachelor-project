@@ -5,6 +5,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
 from controller.get_single_calcuation_data import get_single_calculation_data
+from controller.get_schedule_update_data import get_schedule_update_data
 from src.database.database_service import DatabaseService
 
 # Initialize Hydra/OmegaConf configuration similar to notebooks
@@ -32,3 +33,8 @@ def calculations_single(unit_mastr_number):
 @app.route("/calculations/aggregated")
 def calculations_aggregated():
     return jsonify(get_aggregated_calculation_data(app.config["CFG"], database_service))
+
+
+@app.route("/schedule/update_data")
+def schedule_update_data():
+    return jsonify(get_schedule_update_data(app.config["CFG"], database_service))
