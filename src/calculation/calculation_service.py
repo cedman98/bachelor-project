@@ -115,3 +115,33 @@ class CalculationService:
         return self.wind_calculation_data_provider.extrapolate_to_hub_height(
             measurements_df
         )
+
+    def calculate_power_production(self, measurements_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Calculate the power production for all wind turbines.
+        @param measurements_df: The measurements DataFrame.
+        @return: The power production DataFrame.
+        """
+        if (
+            "unit_mastr_number" not in measurements_df.columns
+            or "hub_height_wind_speed" not in measurements_df.columns
+        ):
+            raise ValueError(
+                "measurements_df must have the columns 'unit_mastr_number' and 'hub_height_wind_speed'"
+            )
+
+        matched_df = (
+            self.power_curves_data_provider.get_all_turbine_id_for_mastr_number(
+                measurements_df
+            )
+        )
+
+        power_curves_df = self.power_curves_data_provider.load_from_database()
+
+        power_production_df = (
+            self.power_curves_data_provider.calculate_wind_power_production(
+                measurements_df, matched_df, power_curves_df
+            )
+        )
+
+        return power_production_df
