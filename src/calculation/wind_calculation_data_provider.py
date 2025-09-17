@@ -1,6 +1,10 @@
 import numpy as np
 from omegaconf import OmegaConf
 import pandas as pd
+from loguru import logger
+from sqlalchemy.orm import Session
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from src.database.schema import WindPowerCalculations
 from src.database.database_service import DatabaseService
 
 
@@ -312,3 +316,78 @@ class WindCalculationDataProvider:
         measurements_df["hub_height_wind_speed"] = measurements_df["wind_speed"]
 
         return measurements_df
+
+    def save_calculations_to_database(self, calculations_df: pd.DataFrame) -> None:
+        """
+        Save the calculations to the database.
+        @param calculations_df: The calculations DataFrame.
+        """
+        if calculations_df is None or calculations_df.empty:
+            logger.warning("No calculations to save")
+            return
+
+        # Rename columns to match schema
+        rename_map = {
+            "wind_speed": "extrapolated_wind_speed",
+            "hub_height_wind_speed": "extrapolated_hub_height_wind_speed",
+        }
+        df = calculations_df.rename(columns=rename_map).copy()
+
+        # Filter to allowed columns defined by the table
+        table = WindPowerCalculations.__table__
+        allowed_columns = set(table.columns.keys())
+        records = [
+            {k: v for k, v in row.items() if k in allowed_columns}
+            for row in df.to_dict(orient="records")
+        ]
+
+        if not records:
+            logger.warning(
+                "No compatible columns found to upsert into wind_power_calculations"
+            )
+            return
+
+        chunk_size = 7500
+        max_retries = 3
+        total = len(records)
+
+        for start in range(0, total, chunk_size):
+            chunk = records[start : start + chunk_size]
+            attempt = 0
+            while True:
+                try:
+                    stmt = pg_insert(table).values(chunk)
+                    update_columns = {
+                        c.name: stmt.excluded[c.name]
+                        for c in table.columns
+                        if c.name not in {"id"}
+                    }
+                    # Prefer a deterministic upsert on natural key
+                    # Use index_elements to avoid relying on a possibly-misnamed constraint
+                    stmt = stmt.on_conflict_do_update(
+                        index_elements=["unit_mastr_number", "record_date"],
+                        set_=update_columns,
+                    )
+
+                    with Session(self.database_service.engine) as session:
+                        session.execute(stmt)
+                        session.commit()
+
+                    logger.info(
+                        f"Upserted calculations chunk {start}-{min(start+chunk_size, total)} of {total}"
+                    )
+                    break
+                except Exception as e:
+                    attempt += 1
+                    if attempt >= max_retries:
+                        logger.error(
+                            f"Failed upserting calculations chunk {start}-{min(start+chunk_size, total)} after {max_retries} attempts: {e}"
+                        )
+                        raise
+                    sleep_s = 2 ** (attempt - 1)
+                    logger.warning(
+                        f"Error during upsert (attempt {attempt}/{max_retries}) for chunk {start}-{min(start+chunk_size, total)}: {e}. Retrying in {sleep_s}s"
+                    )
+                    import time as _time
+
+                    _time.sleep(sleep_s)

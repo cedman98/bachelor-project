@@ -15,6 +15,7 @@ class CalculationService:
     wind_turbines: pd.DataFrame
     weather_stations: pd.DataFrame
     measurement_service: MeasurementService
+    wind_calculation_data_provider: WindCalculationDataProvider
     power_curves_data_provider: PowerCurvesDataProvider
 
     def __init__(
@@ -142,6 +143,10 @@ class CalculationService:
             self.power_curves_data_provider.calculate_wind_power_production(
                 measurements_df, matched_df, power_curves_df
             )
+        )
+
+        self.wind_calculation_data_provider.save_calculations_to_database(
+            power_production_df
         )
 
         return power_production_df

@@ -91,6 +91,24 @@ class WindTurbines(Base):
     latitude: Mapped[float] = mapped_column(Float, index=True)
 
 
+class WindPowerCalculations(Base):
+    __tablename__ = "wind_power_calculations"
+    __table_args__ = (
+        UniqueConstraint("unit_mastr_number", "record_date", name="uix_wpc_unit_date"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    unit_mastr_number: Mapped[str] = mapped_column(
+        String, ForeignKey("wind_turbines.unit_mastr_number"), index=True
+    )
+    record_date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    u: Mapped[float] = mapped_column(Float)
+    v: Mapped[float] = mapped_column(Float)
+    is_prediction: Mapped[bool] = mapped_column(Boolean)
+    extrapolated_wind_speed: Mapped[float] = mapped_column(Float)
+    extrapolated_hub_height_wind_speed: Mapped[float] = mapped_column(Float)
+    pred_power_production: Mapped[float] = mapped_column(Float)
+
+
 class TurbinePowerCurves(Base):
     __tablename__ = "turbine_power_curves"
     __table_args__ = (
