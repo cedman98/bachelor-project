@@ -4,6 +4,7 @@ import os
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig, OmegaConf
 
+from controller.get_single_calcuation_data import get_single_calculation_data
 from src.database.database_service import DatabaseService
 
 # Initialize Hydra/OmegaConf configuration similar to notebooks
@@ -17,6 +18,15 @@ app = Flask(__name__)
 app.config["CFG"] = cfg
 
 database_service = DatabaseService(app.config["CFG"])
+
+
+@app.route("/calculations/single/<unit_mastr_number>")
+def calculations_single(unit_mastr_number):
+    return jsonify(
+        get_single_calculation_data(
+            app.config["CFG"], database_service, unit_mastr_number
+        )
+    )
 
 
 @app.route("/calculations/aggregated")
