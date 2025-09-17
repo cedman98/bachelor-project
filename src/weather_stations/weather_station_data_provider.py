@@ -213,12 +213,20 @@ class WeatherStationDataProvider:
             table = WeatherStations.__table__
             query = select(table)
             if only_relevant:
-                query = query.where(table.c.is_active == True).where(
-                    or_(
-                        table.c.state == "Brandenburg",
-                        table.c.weather_station_id.in_(
-                            self.cfg.dwd.additional_measurement_stations
-                        ),
+                query = (
+                    query.where(table.c.is_active == True)
+                    .where(
+                        or_(
+                            table.c.state == "Brandenburg",
+                            table.c.weather_station_id.in_(
+                                self.cfg.dwd.additional_measurement_stations
+                            ),
+                        )
+                    )
+                    .where(
+                        ~table.c.weather_station_id.in_(
+                            self.cfg.dwd.exclude_brandenburg_measurement_stations
+                        )
                     )
                 )
             query = query.order_by(table.c.weather_station_id)

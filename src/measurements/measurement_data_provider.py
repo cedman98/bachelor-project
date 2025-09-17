@@ -146,6 +146,12 @@ class MeasurementDataProvider:
         out_df = out_df[out_df["valid_row_mask"]].copy()
         out_df.drop(columns=["valid_row_mask"], inplace=True)
 
+        # Drop all rows where average_wind_speed is -999 or average_wind_direction is -999
+        out_df = out_df[
+            (out_df["average_wind_speed"] != -999)
+            & (out_df["average_wind_direction"] != -999)
+        ]
+
         return out_df.reset_index(drop=True)
 
     def save_measurement_df_to_database(self, df: pd.DataFrame) -> None:
@@ -287,11 +293,15 @@ class MeasurementDataProvider:
         query = select(table)
         return self.load_measurements_from_database(query)
 
-    def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
+    def load_all_measurements_grid_backfilled_from_database(self) -> pd.DataFrame:
         """
-        Load the last 72 measurements per station using an efficient per-station LIMIT.
-        Uses a LATERAL join so the DB can leverage the (station_id, record_date DESC) index.
-        @return: The measurements DataFrame.
+        Load measurements for all active stations across the full available time range.
+        - Determine oldest and latest record_date from wind_station_measurements
+        - Build a 10-minute interval grid for every station between these bounds
+        - For each station_id and step_time, take the last known measurement at or before step_time
+
+        This mirrors the approach used in load_all_recent_measurements_from_database,
+        but spans the entire time range present in the table instead of the last 72 steps.
         """
 
         additional_ids = list(self.cfg.dwd.additional_measurement_stations or [])
@@ -299,18 +309,18 @@ class MeasurementDataProvider:
         query = text(
             """
             WITH
-            max_ts AS (
-              SELECT max(record_date) AS max_record_date
+            stats AS (
+              SELECT
+                min(record_date) AS min_record_date,
+                max(record_date) AS max_record_date
               FROM wind_station_measurements
             ),
             steps AS (
-              SELECT
-                gs.step_idx,
-                (m.max_record_date - (gs.step_idx || ' minutes')::interval) AS step_time
-              FROM max_ts m
-              CROSS JOIN LATERAL (
-                SELECT generate_series(0, 71) * 10 AS step_idx
-              ) gs
+              SELECT generate_series(
+                (SELECT min_record_date FROM stats),
+                (SELECT max_record_date FROM stats),
+                INTERVAL '10 minutes'
+              ) AS step_time
             ),
             stations AS (
               SELECT weather_station_id AS station_id
@@ -374,6 +384,101 @@ class MeasurementDataProvider:
             ORDER BY station_id, step_time ASC
             """
         ).bindparams(bindparam("additional_ids", expanding=True, value=additional_ids))
+
+        return self.load_measurements_from_database(query)
+
+    def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
+        """
+        Load the last 72 measurements per station using an efficient per-station LIMIT.
+        Uses a LATERAL join so the DB can leverage the (station_id, record_date DESC) index.
+        @return: The measurements DataFrame.
+        """
+
+        additional_ids = list(self.cfg.dwd.additional_measurement_stations or [])
+        exclude_ids = list(self.cfg.dwd.exclude_brandenburg_measurement_stations or [])
+
+        query = text(
+            """
+            WITH
+            max_ts AS (
+              SELECT max(record_date) AS max_record_date
+              FROM wind_station_measurements
+            ),
+            steps AS (
+              SELECT
+                gs.step_idx,
+                (m.max_record_date - (gs.step_idx || ' minutes')::interval) AS step_time
+              FROM max_ts m
+              CROSS JOIN LATERAL (
+                SELECT generate_series(0, 71) * 10 AS step_idx
+              ) gs
+            ),
+            stations AS (
+              SELECT weather_station_id AS station_id
+              FROM weather_stations
+              WHERE is_active = TRUE
+                AND (
+                  state = 'Brandenburg'
+                  OR weather_station_id IN :additional_ids
+                )
+                AND weather_station_id NOT IN :exclude_ids
+            ),
+            grid AS (
+              SELECT st.station_id, s.step_time
+              FROM stations st
+              CROSS JOIN steps s
+            ),
+            latest_per_step AS (
+              SELECT DISTINCT ON (g.station_id, g.step_time)
+                g.station_id,
+                g.step_time,
+                m.id,
+                m.quality_level,
+                m.average_wind_speed,
+                m.average_wind_direction,
+                m.air_pressure,
+                m.air_temperature_2m,
+                m.air_temperature_5cm,
+                m.relative_humidity,
+                m.dew_point_temperature,
+                m.precipitation_duration,
+                m.sum_precipitation_height,
+                m.precipitation_indicator,
+                m.record_date AS measurement_record_date
+              FROM grid g
+              LEFT JOIN LATERAL (
+                SELECT *
+                FROM wind_station_measurements m2
+                WHERE m2.station_id = g.station_id
+                  AND m2.record_date <= g.step_time
+                ORDER BY m2.record_date DESC
+                LIMIT 1
+              ) m ON true
+              ORDER BY g.station_id, g.step_time, m.record_date DESC NULLS LAST
+            )
+            SELECT
+              station_id,
+              step_time AS record_date,
+              id,
+              quality_level,
+              average_wind_speed,
+              average_wind_direction,
+              air_pressure,
+              air_temperature_2m,
+              air_temperature_5cm,
+              relative_humidity,
+              dew_point_temperature,
+              precipitation_duration,
+              sum_precipitation_height,
+              precipitation_indicator,
+              measurement_record_date
+            FROM latest_per_step
+            ORDER BY station_id, step_time ASC
+            """
+        ).bindparams(
+            bindparam("additional_ids", expanding=True, value=additional_ids),
+            bindparam("exclude_ids", expanding=True, value=exclude_ids),
+        )
 
         return self.load_measurements_from_database(query)
 

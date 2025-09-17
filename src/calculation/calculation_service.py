@@ -105,3 +105,13 @@ class CalculationService:
         return self.wind_calculation_data_provider.extrapolate_u_and_v_to_all_wind_turbines(
             wind_turbines_df, weather_stations_df, measurements_df
         )
+
+    def extrapolate_to_hub_height(self, measurements_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Extrapolate to hub height.
+        @param measurements_df: The measurements DataFrame.
+        @return: The extrapolated measurements DataFrame.
+        """
+        return self.wind_calculation_data_provider.extrapolate_to_hub_height(
+            measurements_df
+        )

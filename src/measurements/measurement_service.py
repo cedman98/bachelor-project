@@ -113,6 +113,15 @@ class MeasurementService:
         """
         return self.measurement_data_provider.load_all_measurements_from_database()
 
+    def load_all_measurements_grid_backfilled_from_database(self) -> pd.DataFrame:
+        """
+        Load all measurements from the database.
+        @return: The measurements DataFrame.
+        """
+        return (
+            self.measurement_data_provider.load_all_measurements_grid_backfilled_from_database()
+        )
+
     def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
         """
         The function loads for all stations the last 72 measurements.

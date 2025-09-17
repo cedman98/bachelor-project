@@ -1,23 +1,27 @@
 database:
   url: ${oc.env:DATABASE_URL,"postgresql+psycopg://neon:npg@localhost:5432/neondb"}
   echo: False
+  measurement_upsert_chunk_size: 5000
 dwd:
   weather_stations_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/daily/kl/recent/KL_Tageswerte_Beschreibung_Stationen.txt"
   measurements_base_url: "https://opendata.dwd.de/climate_environment/CDC/observations_germany/climate/10_minutes/"
+  exclude_brandenburg_measurement_stations:
+    - 3509
+    - 5643
+    - 5745
+    - 6170
+    - 6265
+    - 2315
+    - 2627
+    - 2951
+    - 3083
   additional_measurement_stations:
-    - 400
-    - 403
-    - 420
     - 433
     - 1048
-    - 1052
     - 1605
     - 1694
-    - 2641
     - 3093
     - 3196
-    - 3234
-    - 3426
     - 3811
     - 4642
     - 5109
@@ -25,8 +29,6 @@ dwd:
     - 5349
     - 5629
     - 6106
-    - 6109
-    - 6273
     - 7351
     - 7393
 

@@ -296,3 +296,19 @@ class WindCalculationDataProvider:
             ]
         ]
         return result_df
+
+    def extrapolate_to_hub_height(self, measurements_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Extrapolate to hub height.
+        @param measurements_df: The measurements DataFrame.
+        @return: The extrapolated measurements DataFrame.
+        """
+        # Calculate wind speed from u and v components
+        measurements_df["wind_speed"] = np.sqrt(
+            measurements_df["u"] ** 2 + measurements_df["v"] ** 2
+        )
+
+        # TODO: Extrapolate to hub height, this is mock
+        measurements_df["hub_height_wind_speed"] = measurements_df["wind_speed"]
+
+        return measurements_df
