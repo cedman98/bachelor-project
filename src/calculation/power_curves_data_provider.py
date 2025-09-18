@@ -228,9 +228,7 @@ class PowerCurvesDataProvider:
 
             results = session.execute(query).mappings().all()
             df = pd.DataFrame(results)
-            logger.info(
-                f"Loaded {len(df)} turbine ids for mastr number {mastr_number} from database"
-            )
+            logger.info(f"Loaded {len(df)} turbine ids")
             return df
 
     def calculate_wind_power_production(

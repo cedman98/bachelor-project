@@ -312,8 +312,13 @@ class WindCalculationDataProvider:
             measurements_df["u"] ** 2 + measurements_df["v"] ** 2
         )
 
-        # TODO: Extrapolate to hub height, this is mock
-        measurements_df["hub_height_wind_speed"] = measurements_df["wind_speed"]
+        alpha = self.cfg.wind_power_calculation.alpha
+        measurement_height = self.cfg.wind_power_calculation.measurement_height
+
+        # Scale for power law (Hellman)
+        scale = (measurements_df["hub_height"] / measurement_height) ** alpha
+
+        measurements_df["hub_height_wind_speed"] = measurements_df["wind_speed"] * scale
 
         return measurements_df
 

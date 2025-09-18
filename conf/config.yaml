@@ -82,3 +82,7 @@ processing:
       - "type_designation"
       - "hub_height"
       - "rotor_diameter"
+
+wind_power_calculation:
+  alpha: 0.14
+  measurement_height: 10
