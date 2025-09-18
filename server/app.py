@@ -1,4 +1,4 @@
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request, make_response
 from controller.get_aggregated_calculation_data import get_aggregated_calculation_data
 import os
 from hydra import compose, initialize_config_dir
@@ -19,6 +19,28 @@ app = Flask(__name__)
 app.config["CFG"] = cfg
 
 database_service = DatabaseService(app.config["CFG"])
+
+
+@app.before_request
+def handle_cors_preflight():
+    if request.method == "OPTIONS":
+        response = make_response("", 204)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = (
+            "GET, POST, PUT, DELETE, OPTIONS"
+        )
+        response.headers["Access-Control-Allow-Headers"] = request.headers.get(
+            "Access-Control-Request-Headers", "*"
+        )
+        return response
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    return response
 
 
 @app.route("/calculations/single/<unit_mastr_number>")
