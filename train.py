@@ -26,22 +26,27 @@ def main():
     train_df = measurements_df[(measurements_df['record_date']<=end_date)].copy()
     test_df = measurements_df[measurements_df['record_date']>end_date].copy()
     
-    # PatchTST prototype hyperparameters for RTX 4080 Super
+    # PatchTST full train hyperparameters for RTX 4080 Super
+    # With history_steps increased to 288 (24 hours at 10-min resolution), most parameters remain valid.
+    # However, patch_len and stride should be considered in relation to the new sequence length.
+    # patch_len=16 and stride=8 will result in (288-16)//8 + 1 = 35 patches per sample, which is reasonable.
+    # d_model, nhead, num_layers, and dim_feedforward are also still appropriate for this input size.
+    # If you observe memory issues, consider reducing batch_size or d_model.
     model = PatchTSTModel(
-        history_steps=144,   # 24 hours of history (10-min resolution)
+        history_steps=288,   # 24 hours of history (10-min resolution)
         horizon_steps=72,    # 12 hours forecast
         d_model=256,
         nhead=8,
         num_layers=4,
         dim_feedforward=512,
-        patch_len=16,
-        stride=8,
+        patch_len=16,        # 16-step patches (still reasonable for 288 steps)
+        stride=8,            # 8-step stride (overlapping patches)
         dropout=0.1,
-        batch_size=128,
+        batch_size=128,      # If you run out of memory, reduce this
         learning_rate=3e-4,
-        num_epochs=5,
+        num_epochs=100,
         val_split=0.2,
-        early_stopping_patience=5,
+        early_stopping_patience=10,
         early_stopping_min_delta=1e-4,
         restore_best_weights=True
     )
