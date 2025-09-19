@@ -759,6 +759,19 @@ class PatchTSTModel(ModelInterface):
             .reset_index(drop=True)
         )
 
+        # After resampling and fills, apply global mean fill for any residual NaNs
+        target_and_numeric = numeric_cols + ["u", "v"]
+        df[target_and_numeric] = df[target_and_numeric].fillna(
+            df[target_and_numeric].mean(numeric_only=True)
+        )
+
+        # Drop rows with missing targets (u or v) as a last resort
+        df = df.dropna(subset=["u", "v"])
+
+        # Replace any remaining inf/-inf with NaN then fill with zeros
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df[target_and_numeric] = df[target_and_numeric].fillna(0.0)
+
         # Ensure ordering
         df = df.sort_values(["station_id", "record_date"]).reset_index(drop=True)
 
@@ -794,6 +807,10 @@ class PatchTSTModel(ModelInterface):
         )
         df[["u", "v"]] = self._target_scaler.transform(df[["u", "v"]].to_numpy(dtype=float))
 
+        # Safety: ensure no NaNs/Infs after scaling
+        df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
+        df[["u", "v"]] = np.nan_to_num(df[["u", "v"]], nan=0.0, posinf=0.0, neginf=0.0)
+
         return df
 
     def _build_sequences(self, df: pd.DataFrame) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], int]:
@@ -811,6 +828,9 @@ class PatchTSTModel(ModelInterface):
             for start in range(0, n - hist - horiz + 1):
                 x = features[start : start + hist]
                 y = targets[start + hist : start + hist + horiz]
+                # Skip sequences that contain non-finite values
+                if not (np.isfinite(x).all() and np.isfinite(y).all()):
+                    continue
                 sequences.append((x, y, sid_idx))
         station_count = len(self._station_id_to_index) if self._station_id_to_index else 0
         return sequences, station_count
