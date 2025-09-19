@@ -262,13 +262,20 @@ class PatchTSTModel(ModelInterface):
             log_every = max(1, num_batches // 10) if num_batches > 0 else 1
             for batch_idx, (xb, yb, sb) in enumerate(train_loader, start=1):
                 non_block = self.device == "cuda"
+                # Skip batch if it contains non-finite values
+                if not (torch.isfinite(xb).all() and torch.isfinite(yb).all()):
+                    continue
                 xb = xb.to(self.device, non_blocking=non_block)
                 yb = yb.to(self.device, non_blocking=non_block)
                 sb = sb.to(self.device, non_blocking=non_block)
 
                 optimizer.zero_grad(set_to_none=True)
                 preds = self._model(xb, sb)
+                if not torch.isfinite(preds).all():
+                    continue
                 loss = loss_fn(preds, yb)
+                if not torch.isfinite(loss):
+                    continue
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
                 optimizer.step()
@@ -801,6 +808,13 @@ class PatchTSTModel(ModelInterface):
             self._target_scaler = StandardScaler()
             self._feature_scaler.fit(df[self._feature_columns].to_numpy(dtype=float))
             self._target_scaler.fit(df[["u", "v"]].to_numpy(dtype=float))
+            # Guard against zero-variance features/targets leading to div-by-zero
+            if hasattr(self._feature_scaler, "scale_"):
+                with np.errstate(invalid="ignore"):
+                    self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = 1.0
+            if hasattr(self._target_scaler, "scale_"):
+                with np.errstate(invalid="ignore"):
+                    self._target_scaler.scale_[self._target_scaler.scale_ == 0.0] = 1.0
 
         df[self._feature_columns] = self._feature_scaler.transform(
             df[self._feature_columns].to_numpy(dtype=float)
@@ -810,6 +824,9 @@ class PatchTSTModel(ModelInterface):
         # Safety: ensure no NaNs/Infs after scaling
         df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
         df[["u", "v"]] = np.nan_to_num(df[["u", "v"]], nan=0.0, posinf=0.0, neginf=0.0)
+        # Clip to a reasonable range to avoid exploding activations
+        df[self._feature_columns] = df[self._feature_columns].clip(lower=-10.0, upper=10.0)
+        df[["u", "v"]] = df[["u", "v"]].clip(lower=-10.0, upper=10.0)
 
         return df
 
