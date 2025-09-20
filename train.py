@@ -20,47 +20,47 @@ def main():
     ms_service = MeasurementService(cfg, db, weather_stations)
     
     measurements_df = ms_service.load_all_measurements_from_database()
+    measurements_df = measurements_df.sort_values(by="record_date")
     logger.info(f"Measurements: {len(measurements_df)} rows")
     
     end_date = pd.Timestamp('2025-04-01')
     train_df = measurements_df[(measurements_df['record_date']<=end_date)].copy()
     test_df = measurements_df[measurements_df['record_date']>end_date].copy()
     
-    # PatchTST full train hyperparameters for RTX 4080 Super
-    # With history_steps increased to 288 (24 hours at 10-min resolution), most parameters remain valid.
-    # However, patch_len and stride should be considered in relation to the new sequence length.
-    # patch_len=16 and stride=8 will result in (288-16)//8 + 1 = 35 patches per sample, which is reasonable.
-    # d_model, nhead, num_layers, and dim_feedforward are also still appropriate for this input size.
-    # If you observe memory issues, consider reducing batch_size or d_model.
+    # PatchTST hourly training hyperparameters (RTX 4080 Super)
+    # Using 12 days (288 hours) of history and forecasting the next 12 hours.
+    # patch_len=16 and stride=8 yield (288-16)//8 + 1 = 35 patches per sample.
+    # d_model, nhead, num_layers, and dim_feedforward remain appropriate.
+    # If you observe memory issues, reduce batch_size or d_model.
     model = PatchTSTModel(
-        history_steps=288,   # 24 hours of history (10-min resolution)
-        horizon_steps=72,    # 12 hours forecast
+        history_steps=144,   # last 24 hours (10-min intervals)
+        horizon_steps=72,    # next 12 hours (10-min intervals)
         d_model=256,
         nhead=8,
-        num_layers=4,
+        num_layers=3,        # slightly shallower for faster prototype
         dim_feedforward=512,
-        patch_len=16,        # 16-step patches (still reasonable for 288 steps)
-        stride=8,            # 8-step stride (overlapping patches)
+        patch_len=16,
+        stride=8,
         dropout=0.1,
-        batch_size=128,      # If you run out of memory, reduce this
+        batch_size=64,       # reduce if you run out of memory
         learning_rate=3e-4,
-        num_epochs=100,
+        num_epochs=10,       # short prototype run; early stopping will cut sooner if needed
         val_split=0.2,
-        early_stopping_patience=10,
+        early_stopping_patience=5,
         early_stopping_min_delta=1e-4,
         restore_best_weights=True
     )
-    
+
     model.train(train_df)
-    
-    save_dir = "models/patch_tst"
+
+    save_dir = "models/patch_tst_prototype"
     os.makedirs(save_dir, exist_ok=True)
     model.save(save_dir)
-    logger.info(f"Saved PatchTST model to {save_dir}")
-    
-    evaluation = model.evaluate(test_df)
-    
-    logger.info(f"Evaluation: {evaluation}")
+    logger.info(f"Saved PatchTST prototype model to {save_dir}")
+
+    # Limit evaluation batches for quicker turnaround in prototype
+    evaluation = model.evaluate(test_df, max_batches=10)
+    logger.info(f"Prototype evaluation (limited batches): {evaluation}")
 
 
 if __name__ == "__main__":

@@ -81,8 +81,10 @@ class _TransformerHead(nn.Module):
         dropout: float,
         horizon_steps: int,
         station_count: int,
+        output_dim_per_step: int,
     ) -> None:
         super().__init__()
+        self.output_dim_per_step = output_dim_per_step
         self.patch_embed = _PatchEmbedding(
             input_dim=input_dim,
             patch_len=patch_len,
@@ -105,7 +107,7 @@ class _TransformerHead(nn.Module):
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, horizon_steps * 2),
+            nn.Linear(d_model, horizon_steps * output_dim_per_step),
         )
 
     def forward(self, x: torch.Tensor, station_idx: torch.Tensor) -> torch.Tensor:
@@ -117,15 +119,15 @@ class _TransformerHead(nn.Module):
         z = torch.cat([s, z], dim=1)  # [B, 1+P, d_model]
         z = self.encoder(z)  # [B, 1+P, d_model]
         cls = z[:, 0, :]  # [B, d_model]
-        out = self.proj(cls)  # [B, H*2]
-        return out.view(x.size(0), -1, 2)
+        out = self.proj(cls)  # [B, H*output_dim]
+        return out.view(x.size(0), -1, self.output_dim_per_step)
 
 
 class PatchTSTModel(ModelInterface):
     """
     PatchTST-style transformer model for 10-min wind forecasting.
 
-    - Uses last 24h (144 steps) of context to predict next 12h (72 steps) of u,v.
+    - Uses last 24h (144 steps) of context to predict next 12h (72 steps) of speed and direction.
     - Handles multi-station data with a learned station embedding.
     - Robust preprocessing: -999 sentinel to NaN, forward/back fill per station, 10-min resample.
     - Scaling for inputs and targets persisted with the model.
@@ -186,10 +188,12 @@ class PatchTSTModel(ModelInterface):
 
         self._model: _TransformerHead | None = None
         self._feature_columns: List[str] | None = None
-        self._target_columns: List[str] = ["u", "v"]
+        # Predict average_wind_speed (scaled) and direction via sin/cos (no scaling): [speed, dir_sin, dir_cos]
+        self._target_columns: List[str] = ["speed", "dir_sin", "dir_cos"]
         self._feature_scaler: StandardScaler | None = None
         self._target_scaler: StandardScaler | None = None
         self._station_id_to_index: Dict[str, int] | None = None
+        self._output_dim_per_step: int = 3
 
     # -------- Public API --------
     def train(self, dataset: pd.DataFrame) -> None:
@@ -224,6 +228,7 @@ class PatchTSTModel(ModelInterface):
             dropout=self.dropout,
             horizon_steps=self.horizon_steps,
             station_count=num_stations,
+            output_dim_per_step=self._output_dim_per_step,
         ).to(self.device)
 
         train_ds = _SequenceDataset(train_sequences)
@@ -353,28 +358,28 @@ class PatchTSTModel(ModelInterface):
 
             self._model.eval()
             with torch.no_grad():
-                y_scaled = self._model(x, sid_idx).squeeze(0).cpu().numpy()
+                y_scaled = self._model(x, sid_idx).squeeze(0).cpu().numpy()  # [H, 3]
 
-            y_flat = y_scaled.reshape(-1, 2)
-            y_inv = self._target_scaler.inverse_transform(y_flat)
-            y_inv = y_inv.reshape(self.horizon_steps, 2)
+            # Inverse scale speed; normalize and decode direction from sin/cos
+            speed_scaled = y_scaled[:, 0:1]
+            dir_sin = y_scaled[:, 1]
+            dir_cos = y_scaled[:, 2]
+            speed_inv = self._target_scaler.inverse_transform(speed_scaled).reshape(-1)
+            norm = np.sqrt(dir_sin**2 + dir_cos**2) + 1e-8
+            dir_sin_n = dir_sin / norm
+            dir_cos_n = dir_cos / norm
 
             last_ts = pd.to_datetime(hist.iloc[-1]["record_date"])
             future_index = [last_ts + freq * (i + 1) for i in range(self.horizon_steps)]
 
-            # derive speed and coming-from direction in degrees
-            u_vals = y_inv[:, 0]
-            v_vals = y_inv[:, 1]
-            speed_vals = np.sqrt(u_vals**2 + v_vals**2)
-            direction_vals = (np.degrees(np.arctan2(-u_vals, -v_vals)) % 360.0)
+            # decode coming-from direction in degrees
+            direction_vals = (np.degrees(np.arctan2(dir_sin_n, dir_cos_n)) % 360.0)
 
             out_df = pd.DataFrame(
                 {
                     "station_id": station_id,
                     "record_date": future_index,
-                    "u_pred": y_inv[:, 0],
-                    "v_pred": y_inv[:, 1],
-                    "average_wind_speed_pred": speed_vals,
+                    "average_wind_speed_pred": speed_inv,
                     "average_wind_direction_pred": direction_vals,
                 }
             )
@@ -412,78 +417,72 @@ class PatchTSTModel(ModelInterface):
         self._model.eval()
         non_block = self.device == "cuda" and torch.cuda.is_available()
 
-        preds_u: List[np.ndarray] = []
-        preds_v: List[np.ndarray] = []
-        trues_u: List[np.ndarray] = []
-        trues_v: List[np.ndarray] = []
+        preds_speed: List[np.ndarray] = []
+        trues_speed: List[np.ndarray] = []
+        preds_dir_deg: List[np.ndarray] = []
+        trues_dir_deg: List[np.ndarray] = []
 
         with torch.no_grad():
             for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
                 xb = xb.to(self.device, non_blocking=non_block)
                 sb = sb.to(self.device, non_blocking=non_block)
 
-                y_pred_scaled = self._model(xb, sb).cpu().numpy()
-                y_true_scaled = yb.cpu().numpy()
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
 
                 B, H, _ = y_pred_scaled.shape
-                y_pred = self._target_scaler.inverse_transform(y_pred_scaled.reshape(-1, 2)).reshape(B, H, 2)
-                y_true = self._target_scaler.inverse_transform(y_true_scaled.reshape(-1, 2)).reshape(B, H, 2)
+                # Inverse speed scaling
+                speed_pred = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                speed_true = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
 
-                preds_u.append(y_pred[:, :, 0].reshape(-1))
-                preds_v.append(y_pred[:, :, 1].reshape(-1))
-                trues_u.append(y_true[:, :, 0].reshape(-1))
-                trues_v.append(y_true[:, :, 1].reshape(-1))
+                # Decode directions
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                pred_dir = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
+                true_dir = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+
+                preds_speed.append(speed_pred.reshape(-1))
+                trues_speed.append(speed_true.reshape(-1))
+                preds_dir_deg.append(pred_dir.reshape(-1))
+                trues_dir_deg.append(true_dir.reshape(-1))
 
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
-        u_pred = np.concatenate(preds_u)
-        v_pred = np.concatenate(preds_v)
-        u_true = np.concatenate(trues_u)
-        v_true = np.concatenate(trues_v)
+        speed_pred_all = np.concatenate(preds_speed)
+        speed_true_all = np.concatenate(trues_speed)
+        dir_pred_all = np.concatenate(preds_dir_deg)
+        dir_true_all = np.concatenate(trues_dir_deg)
 
-        mae_u = float(np.mean(np.abs(u_pred - u_true)))
-        rmse_u = float(np.sqrt(np.mean((u_pred - u_true) ** 2)))
-        mae_v = float(np.mean(np.abs(v_pred - v_true)))
-        rmse_v = float(np.sqrt(np.mean((v_pred - v_true) ** 2)))
-
-        speed_pred = np.sqrt(u_pred**2 + v_pred**2)
-        speed_true = np.sqrt(u_true**2 + v_true**2)
-        mae_speed = float(np.mean(np.abs(speed_pred - speed_true)))
-        rmse_speed = float(np.sqrt(np.mean((speed_pred - speed_true) ** 2)))
-
-        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
-            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
-            return np.mod(ang, 360.0)
+        mae_speed = float(np.mean(np.abs(speed_pred_all - speed_true_all)))
+        rmse_speed = float(np.sqrt(np.mean((speed_pred_all - speed_true_all) ** 2)))
 
         def angular_mae_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
             diff = np.abs(((a_deg - b_deg + 180.0) % 360.0) - 180.0)
             return float(np.mean(diff))
 
-        dir_pred = uv_to_dir_deg(u_pred, v_pred)
-        dir_true = uv_to_dir_deg(u_true, v_true)
-        mae_dir_deg = angular_mae_deg(dir_pred, dir_true)
+        mae_direction_deg = angular_mae_deg(dir_pred_all, dir_true_all)
 
         metrics = {
-            "mae_u": mae_u,
-            "rmse_u": rmse_u,
-            "mae_v": mae_v,
-            "rmse_v": rmse_v,
             "mae_speed": mae_speed,
             "rmse_speed": rmse_speed,
-            "mae_direction_deg": mae_dir_deg,
+            "mae_direction_deg": mae_direction_deg,
         }
         logger.info(
             "Evaluation metrics: "
             + ", ".join(
                 [
-                    f"mae_u={mae_u:.4f}",
-                    f"rmse_u={rmse_u:.4f}",
-                    f"mae_v={mae_v:.4f}",
-                    f"rmse_v={rmse_v:.4f}",
                     f"mae_speed={mae_speed:.4f}",
                     f"rmse_speed={rmse_speed:.4f}",
-                    f"mae_direction_deg={mae_dir_deg:.2f}°",
+                    f"mae_direction_deg={mae_direction_deg:.2f}°",
                 ]
             )
         )
@@ -512,10 +511,6 @@ class PatchTSTModel(ModelInterface):
         )
 
         H = self.horizon_steps
-        sum_abs_u = np.zeros(H, dtype=float)
-        sum_sq_u = np.zeros(H, dtype=float)
-        sum_abs_v = np.zeros(H, dtype=float)
-        sum_sq_v = np.zeros(H, dtype=float)
         sum_abs_speed = np.zeros(H, dtype=float)
         sum_sq_speed = np.zeros(H, dtype=float)
         sum_abs_dir = np.zeros(H, dtype=float)
@@ -524,47 +519,40 @@ class PatchTSTModel(ModelInterface):
         self._model.eval()
         non_block = self.device == "cuda" and torch.cuda.is_available()
 
-        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
-            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
-            return np.mod(ang, 360.0)
+        def angular_error_deg(pred_deg: np.ndarray, true_deg: np.ndarray) -> np.ndarray:
+            return np.abs(((pred_deg - true_deg + 180.0) % 360.0) - 180.0)
 
         with torch.no_grad():
             for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
                 xb = xb.to(self.device, non_blocking=non_block)
                 sb = sb.to(self.device, non_blocking=non_block)
 
-                y_pred_scaled = self._model(xb, sb).cpu().numpy()
-                y_true_scaled = yb.cpu().numpy()
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
 
                 B, H_, _ = y_pred_scaled.shape
                 assert H_ == H
 
-                y_pred = self._target_scaler.inverse_transform(y_pred_scaled.reshape(-1, 2)).reshape(B, H, 2)
-                y_true = self._target_scaler.inverse_transform(y_true_scaled.reshape(-1, 2)).reshape(B, H, 2)
+                sp_p = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                sp_t = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
 
-                u_p = y_pred[:, :, 0]
-                v_p = y_pred[:, :, 1]
-                u_t = y_true[:, :, 0]
-                v_t = y_true[:, :, 1]
-
-                abs_u = np.abs(u_p - u_t).sum(axis=0)
-                sq_u = ((u_p - u_t) ** 2).sum(axis=0)
-                abs_v = np.abs(v_p - v_t).sum(axis=0)
-                sq_v = ((v_p - v_t) ** 2).sum(axis=0)
-
-                sp_p = np.sqrt(u_p**2 + v_p**2)
-                sp_t = np.sqrt(u_t**2 + v_t**2)
                 abs_sp = np.abs(sp_p - sp_t).sum(axis=0)
                 sq_sp = ((sp_p - sp_t) ** 2).sum(axis=0)
 
-                dir_p = uv_to_dir_deg(u_p, v_p)
-                dir_t = uv_to_dir_deg(u_t, v_t)
-                diff_dir = np.abs(((dir_p - dir_t + 180.0) % 360.0) - 180.0).sum(axis=0)
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                dir_p = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
+                dir_t = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+                diff_dir = angular_error_deg(dir_p, dir_t).sum(axis=0)
 
-                sum_abs_u += abs_u
-                sum_sq_u += sq_u
-                sum_abs_v += abs_v
-                sum_sq_v += sq_v
                 sum_abs_speed += abs_sp
                 sum_sq_speed += sq_sp
                 sum_abs_dir += diff_dir
@@ -575,19 +563,11 @@ class PatchTSTModel(ModelInterface):
 
         count = np.maximum(count, 1.0)
 
-        mae_u = (sum_abs_u / count).tolist()
-        rmse_u = np.sqrt(sum_sq_u / count).tolist()
-        mae_v = (sum_abs_v / count).tolist()
-        rmse_v = np.sqrt(sum_sq_v / count).tolist()
         mae_speed = (sum_abs_speed / count).tolist()
         rmse_speed = np.sqrt(sum_sq_speed / count).tolist()
         mae_direction_deg = (sum_abs_dir / count).tolist()
 
         metrics: Dict[str, List[float]] = {
-            "mae_u": mae_u,
-            "rmse_u": rmse_u,
-            "mae_v": mae_v,
-            "rmse_v": rmse_v,
             "mae_speed": mae_speed,
             "rmse_speed": rmse_speed,
             "mae_direction_deg": mae_direction_deg,
@@ -603,19 +583,15 @@ class PatchTSTModel(ModelInterface):
                 horizons = np.arange(1, H + 1)
 
                 fig1 = plt.figure(figsize=(10, 6))
-                plt.plot(horizons, mae_u, label="MAE u")
-                plt.plot(horizons, rmse_u, label="RMSE u")
-                plt.plot(horizons, mae_v, label="MAE v")
-                plt.plot(horizons, rmse_v, label="RMSE v")
                 plt.plot(horizons, mae_speed, label="MAE speed")
                 plt.plot(horizons, rmse_speed, label="RMSE speed")
                 plt.xlabel("Horizon (steps, 10-min)")
                 plt.ylabel("Error")
-                plt.title("Per-horizon errors: u, v, speed")
+                plt.title("Per-horizon errors: speed")
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 fig1.tight_layout()
-                fig1.savefig(os.path.join(save_dir, "per_horizon_uv_speed.png"), dpi=150)
+                fig1.savefig(os.path.join(save_dir, "per_horizon_speed.png"), dpi=150)
                 plt.close(fig1)
 
                 fig2 = plt.figure(figsize=(10, 4))
@@ -694,6 +670,8 @@ class PatchTSTModel(ModelInterface):
         self._station_id_to_index = dict(metadata["station_id_to_index"])  # type: ignore[arg-type]
         self._feature_scaler = metadata["feature_scaler"]
         self._target_scaler = metadata["target_scaler"]
+        # Backward compatibility: set output dim
+        self._output_dim_per_step = 3 if self._target_columns == ["speed", "dir_sin", "dir_cos"] else 2
 
         feature_dim = len(self._feature_columns)
         station_count = len(self._station_id_to_index) if self._station_id_to_index else 0
@@ -708,6 +686,7 @@ class PatchTSTModel(ModelInterface):
             dropout=self.dropout,
             horizon_steps=self.horizon_steps,
             station_count=station_count,
+            output_dim_per_step=self._output_dim_per_step,
         ).to(self.device)
         state_dict = torch.load(model_path, map_location=self.device)
         self._model.load_state_dict(state_dict)
@@ -744,18 +723,25 @@ class PatchTSTModel(ModelInterface):
         for col in numeric_cols:
             df[col] = df[col].replace(-999, np.nan)
 
-        # Create u, v targets (meteorological coming-from)
+        # Create derived columns for modeling
+        # u, v from meteorological coming-from convention (still used as inputs)
         direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
         speed = df["average_wind_speed"].astype(float)
         df["u"] = -speed * np.sin(direction_rad)
         df["v"] = -speed * np.cos(direction_rad)
+        # Targets: speed (same as average_wind_speed) and direction as sin/cos
+        df["speed"] = speed
+        df["dir_sin"] = np.sin(direction_rad)
+        df["dir_cos"] = np.cos(direction_rad)
 
         # Resample to regular 10-minute grid per station and forward/back-fill
         freq = "10min"
         def resample_group(g: pd.DataFrame) -> pd.DataFrame:
             g = g.sort_values("record_date").set_index("record_date")
             g = g.asfreq(freq)
-            g[numeric_cols + ["u", "v"]] = g[numeric_cols + ["u", "v"]].ffill().bfill()
+            g[numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]] = (
+                g[numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]].ffill().bfill()
+            )
             # Keep station_id
             g["station_id"] = g["station_id"].ffill().bfill()
             return g.reset_index()
@@ -767,13 +753,13 @@ class PatchTSTModel(ModelInterface):
         )
 
         # After resampling and fills, apply global mean fill for any residual NaNs
-        target_and_numeric = numeric_cols + ["u", "v"]
+        target_and_numeric = numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]
         df[target_and_numeric] = df[target_and_numeric].fillna(
             df[target_and_numeric].mean(numeric_only=True)
         )
 
-        # Drop rows with missing targets (u or v) as a last resort
-        df = df.dropna(subset=["u", "v"])
+        # Drop rows with missing targets as a last resort
+        df = df.dropna(subset=["speed", "dir_sin", "dir_cos"])
 
         # Replace any remaining inf/-inf with NaN then fill with zeros
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -807,7 +793,8 @@ class PatchTSTModel(ModelInterface):
             self._feature_scaler = StandardScaler()
             self._target_scaler = StandardScaler()
             self._feature_scaler.fit(df[self._feature_columns].to_numpy(dtype=float))
-            self._target_scaler.fit(df[["u", "v"]].to_numpy(dtype=float))
+            # Only scale speed; direction sin/cos remain unscaled
+            self._target_scaler.fit(df[["speed"]].to_numpy(dtype=float))
             # Guard against zero-variance features/targets leading to div-by-zero
             if hasattr(self._feature_scaler, "scale_"):
                 with np.errstate(invalid="ignore"):
@@ -819,14 +806,17 @@ class PatchTSTModel(ModelInterface):
         df[self._feature_columns] = self._feature_scaler.transform(
             df[self._feature_columns].to_numpy(dtype=float)
         )
-        df[["u", "v"]] = self._target_scaler.transform(df[["u", "v"]].to_numpy(dtype=float))
+        df[["speed"]] = self._target_scaler.transform(df[["speed"]].to_numpy(dtype=float))
 
         # Safety: ensure no NaNs/Infs after scaling
         df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
-        df[["u", "v"]] = np.nan_to_num(df[["u", "v"]], nan=0.0, posinf=0.0, neginf=0.0)
+        df[["speed", "dir_sin", "dir_cos"]] = np.nan_to_num(
+            df[["speed", "dir_sin", "dir_cos"]], nan=0.0, posinf=0.0, neginf=0.0
+        )
         # Clip to a reasonable range to avoid exploding activations
         df[self._feature_columns] = df[self._feature_columns].clip(lower=-10.0, upper=10.0)
-        df[["u", "v"]] = df[["u", "v"]].clip(lower=-10.0, upper=10.0)
+        df[["speed"]] = df[["speed"]].clip(lower=-10.0, upper=10.0)
+        df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(lower=-1.0, upper=1.0)
 
         return df
 
@@ -837,7 +827,7 @@ class PatchTSTModel(ModelInterface):
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
             features = g[self._feature_columns].to_numpy(dtype=float)
-            targets = g[["u", "v"]].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
             n = len(g)
             if n < hist + horiz:
                 continue
@@ -862,7 +852,7 @@ class PatchTSTModel(ModelInterface):
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
             features = g[self._feature_columns].to_numpy(dtype=float)
-            targets = g[["u", "v"]].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
             n = len(g)
             if n < hist + horiz:
                 continue
