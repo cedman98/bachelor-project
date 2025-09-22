@@ -144,6 +144,17 @@ class WindTurbinesDataProvider:
             logger.info(f"Loaded {len(df)} wind turbines from database")
             return df
 
+    def load_one_unit_from_database(self, unit_mastr_number: str) -> pd.DataFrame:
+        """
+        Load one unit from the database.
+        """
+        with Session(self.database_service.engine) as session:
+            table = WindTurbines.__table__
+            query = select(table).where(table.c.unit_mastr_number == unit_mastr_number)
+            rows = session.execute(query).mappings().all()
+            df = pd.DataFrame(rows)
+            return df
+
     def _download_file(self, download_url: str, file_name: str) -> str:
         """
         Download the file from the download url.

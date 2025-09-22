@@ -73,3 +73,11 @@ class WindTurbinesService:
         """
         self.wind_turbines = self.wind_turbines_data_provider.load_from_database()
         return self.wind_turbines
+
+    def load_one_unit_from_database(self, unit_mastr_number: str) -> pd.DataFrame:
+        """
+        Load one unit from the database.
+        """
+        return self.wind_turbines_data_provider.load_one_unit_from_database(
+            unit_mastr_number
+        )
