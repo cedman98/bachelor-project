@@ -156,6 +156,8 @@ class PatchTSTModel(ModelInterface):
         early_stopping_min_delta: float = 1e-4,
         restore_best_weights: bool = True,
         shuffle_train: bool = True,
+        diff_loss_weight: float = 0.2,
+        tv_loss_weight: float = 0.05,
     ) -> None:
         self.cfg = cfg
         self.history_steps = history_steps
@@ -185,6 +187,9 @@ class PatchTSTModel(ModelInterface):
         self.early_stopping_min_delta = float(early_stopping_min_delta)
         self.restore_best_weights = bool(restore_best_weights)
         self.shuffle_train = bool(shuffle_train)
+        # Smoothness regularization weights (encourage temporal consistency across horizon)
+        self.diff_loss_weight = float(diff_loss_weight)
+        self.tv_loss_weight = float(tv_loss_weight)
 
         self._model: _TransformerHead | None = None
         self._feature_columns: List[str] | None = None
@@ -279,6 +284,10 @@ class PatchTSTModel(ModelInterface):
                 if not torch.isfinite(preds).all():
                     continue
                 loss = loss_fn(preds, yb)
+                # Add temporal smoothness regularization across the prediction horizon
+                if (self.diff_loss_weight > 0.0 or self.tv_loss_weight > 0.0) and preds.size(1) > 1:
+                    smooth_loss = self._compute_smoothing_loss(preds, yb)
+                    loss = loss + smooth_loss
                 if not torch.isfinite(loss):
                     continue
                 loss.backward()
@@ -633,6 +642,8 @@ class PatchTSTModel(ModelInterface):
             "num_epochs": self.num_epochs,
             "num_workers": self.num_workers,
             "shuffle_train": self.shuffle_train,
+            "diff_loss_weight": self.diff_loss_weight,
+            "tv_loss_weight": self.tv_loss_weight,
             "feature_columns": self._feature_columns,
             "target_columns": self._target_columns,
             "station_id_to_index": self._station_id_to_index,
@@ -665,6 +676,8 @@ class PatchTSTModel(ModelInterface):
         self.num_epochs = int(metadata.get("num_epochs", self.num_epochs))
         self.num_workers = int(metadata.get("num_workers", self.num_workers))
         self.shuffle_train = bool(metadata.get("shuffle_train", self.shuffle_train))
+        self.diff_loss_weight = float(metadata.get("diff_loss_weight", getattr(self, "diff_loss_weight", 0.2)))
+        self.tv_loss_weight = float(metadata.get("tv_loss_weight", getattr(self, "tv_loss_weight", 0.05)))
         self._feature_columns = list(metadata["feature_columns"])  # type: ignore[arg-type]
         self._target_columns = list(metadata["target_columns"])  # type: ignore[arg-type]
         self._station_id_to_index = dict(metadata["station_id_to_index"])  # type: ignore[arg-type]
@@ -693,6 +706,29 @@ class PatchTSTModel(ModelInterface):
         self._model.eval()
 
     # -------- Internal helpers --------
+    def _compute_smoothing_loss(self, preds: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage temporal smoothness and realistic dynamics over the horizon.
+
+        - Difference-alignment loss: penalize mismatch in first differences of predictions
+          versus ground truth across the horizon (MSE on deltas).
+        - Total-variation loss: penalize large consecutive-step jumps in predictions (L1 on deltas).
+
+        Both operate across all output channels [speed, dir_sin, dir_cos].
+        """
+        try:
+            # preds, y_true: [B, H, C]
+            diff_pred = preds[:, 1:, :] - preds[:, :-1, :]
+            diff_true = y_true[:, 1:, :] - y_true[:, :-1, :]
+            diff_mse = torch.mean((diff_pred - diff_true) ** 2)
+            tv_l1 = torch.mean(torch.abs(diff_pred))
+            loss = self.diff_loss_weight * diff_mse + self.tv_loss_weight * tv_l1
+            if not torch.isfinite(loss):
+                return torch.zeros((), dtype=preds.dtype, device=preds.device)
+            return loss
+        except Exception:
+            # Be conservative: never break training due to auxiliary loss
+            return torch.zeros((), dtype=preds.dtype, device=preds.device)
     def _prepare_dataframe(self, dataset: pd.DataFrame, fit_scalers: bool = True) -> pd.DataFrame:
         required_cols = [
             "station_id",

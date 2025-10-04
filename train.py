@@ -19,7 +19,7 @@ def main():
     
     ms_service = MeasurementService(cfg, db, weather_stations)
     
-    measurements_df = ms_service.load_all_measurements_from_database()
+    measurements_df = pd.read_parquet("data/measurements.parquet")
     measurements_df = measurements_df.sort_values(by="record_date")
     logger.info(f"Measurements: {len(measurements_df)} rows")
     
@@ -42,7 +42,7 @@ def main():
         patch_len=16,
         stride=8,
         dropout=0.1,
-        batch_size=64,       # reduce if you run out of memory
+        batch_size=256,       # reduce if you run out of memory
         learning_rate=3e-4,
         num_epochs=10,       # short prototype run; early stopping will cut sooner if needed
         val_split=0.2,
