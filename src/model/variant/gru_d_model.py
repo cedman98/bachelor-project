@@ -299,6 +299,12 @@ class GRUDModel(ModelInterface):
         self._station_id_to_index: Dict[str, int] | None = None
 
     def train(self, dataset: pd.DataFrame) -> None:
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL TRAINING STARTED")
+        logger.info("=" * 80)
+        logger.info(f"Input dataset: {len(dataset)} rows, {dataset['station_id'].nunique()} unique stations")
+        logger.info(f"Date range: {dataset['record_date'].min()} to {dataset['record_date'].max()}")
+        
         df = self._prepare_dataframe(dataset)
 
         if self.val_split and self.val_split > 0.0:
@@ -316,11 +322,13 @@ class GRUDModel(ModelInterface):
             )
 
         feature_dim = len(self._feature_columns)
+        logger.info("=" * 80)
         logger.info(
             f"Preparing GRU-D training: train_sequences={len(train_sequences)}, "
             f"val_sequences={len(val_sequences)}, stations={num_stations}, "
             f"feature_dim={feature_dim}, device={self.device}"
         )
+        logger.info("=" * 80)
 
         self._model = _GRUDHead(
             input_dim=feature_dim,
@@ -471,7 +479,11 @@ class GRUDModel(ModelInterface):
         # Restore best weights
         if best_state_dict is not None and self.restore_best_weights:
             self._model.load_state_dict(best_state_dict)
-            logger.info("Restored best model weights from validation")
+            logger.info(f"Restored best model weights from validation (best_val_loss={best_val_loss:.6f})")
+        
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL TRAINING COMPLETE")
+        logger.info("=" * 80)
 
     def predict(self, dataset: pd.DataFrame) -> pd.DataFrame:
         if self._model is None:
@@ -479,16 +491,26 @@ class GRUDModel(ModelInterface):
                 "Model not trained. Call train() first or load a saved model."
             )
 
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL PREDICTION STARTED")
+        logger.info("=" * 80)
+        logger.info(f"Input dataset: {len(dataset)} rows, {dataset['station_id'].nunique()} unique stations")
+        
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         results: List[pd.DataFrame] = []
         freq = pd.Timedelta(minutes=10)
+        
+        processed_stations = 0
+        skipped_stations = 0
 
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
             if len(g) < self.history_steps:
+                skipped_stations += 1
                 continue
 
             hist = g.tail(self.history_steps)
+            processed_stations += 1
 
             # Prepare GRU-D inputs
             x_np, mask_np, delta_np, x_last_np = self._prepare_grud_inputs(
@@ -560,7 +582,14 @@ class GRUDModel(ModelInterface):
         if not results:
             raise ValueError("No stations had sufficient history for prediction.")
 
-        return pd.concat(results, axis=0).reset_index(drop=True)
+        final_df = pd.concat(results, axis=0).reset_index(drop=True)
+        logger.info(f"Prediction complete: {processed_stations} stations processed, {skipped_stations} skipped")
+        logger.info(f"Generated {len(final_df)} predictions ({len(final_df) / processed_stations:.1f} per station)")
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL PREDICTION COMPLETE")
+        logger.info("=" * 80)
+        
+        return final_df
 
     def evaluate(self, dataset: pd.DataFrame) -> Dict[str, float]:
         if self._model is None:
@@ -568,6 +597,12 @@ class GRUDModel(ModelInterface):
                 "Model not trained. Call train() first or load a saved model."
             )
 
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL EVALUATION STARTED")
+        logger.info("=" * 80)
+        logger.info(f"Input dataset: {len(dataset)} rows, {dataset['station_id'].nunique()} unique stations")
+        logger.info(f"Date range: {dataset['record_date'].min()} to {dataset['record_date'].max()}")
+        
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         sequences, _ = self._build_sequences(df)
         if len(sequences) == 0:
@@ -582,7 +617,8 @@ class GRUDModel(ModelInterface):
             pin_memory=(self.device == "cuda"),
         )
 
-        logger.info(f"Evaluation: samples={len(eval_ds)}, batch_size={self.batch_size}")
+        logger.info(f"Evaluation dataset: samples={len(eval_ds)}, batch_size={self.batch_size}, batches={len(eval_loader)}")
+        logger.info("Running evaluation...")
 
         self._model.eval()
         non_block = self.device == "cuda"
@@ -661,28 +697,29 @@ class GRUDModel(ModelInterface):
             "mae_direction_deg": mae_dir_deg,
         }
 
-        logger.info(
-            "GRU-D evaluation metrics: "
-            + ", ".join(
-                [
-                    f"mae_u={mae_u:.4f}",
-                    f"rmse_u={rmse_u:.4f}",
-                    f"mae_v={mae_v:.4f}",
-                    f"rmse_v={rmse_v:.4f}",
-                    f"mae_speed={mae_speed:.4f}",
-                    f"rmse_speed={rmse_speed:.4f}",
-                    f"mae_direction_deg={mae_dir_deg:.2f}°",
-                ]
-            )
-        )
+        logger.info("=" * 80)
+        logger.info("GRU-D EVALUATION METRICS:")
+        logger.info("-" * 80)
+        logger.info(f"  U-component:     MAE={mae_u:.4f}, RMSE={rmse_u:.4f}")
+        logger.info(f"  V-component:     MAE={mae_v:.4f}, RMSE={rmse_v:.4f}")
+        logger.info(f"  Wind Speed:      MAE={mae_speed:.4f}, RMSE={rmse_speed:.4f}")
+        logger.info(f"  Wind Direction:  MAE={mae_dir_deg:.2f}°")
+        logger.info("=" * 80)
+        logger.info("GRU-D MODEL EVALUATION COMPLETE")
+        logger.info("=" * 80)
 
         return metrics
 
     def save(self, path: str) -> None:
         if self._model is None:
             raise ValueError("Model not trained. Call train() first.")
+        
+        logger.info(f"Saving GRU-D model to: {path}")
         os.makedirs(path, exist_ok=True)
-        torch.save(self._model.state_dict(), os.path.join(path, "model.pt"))
+        
+        model_path = os.path.join(path, "model.pt")
+        torch.save(self._model.state_dict(), model_path)
+        logger.info(f"  - Saved model weights: {model_path}")
 
         metadata = {
             "history_steps": self.history_steps,
@@ -706,15 +743,21 @@ class GRUDModel(ModelInterface):
             "feature_scaler": self._feature_scaler,
             "target_scaler": self._target_scaler,
         }
-        joblib.dump(metadata, os.path.join(path, "metadata.joblib"))
+        metadata_path = os.path.join(path, "metadata.joblib")
+        joblib.dump(metadata, metadata_path)
+        logger.info(f"  - Saved metadata: {metadata_path}")
+        logger.info(f"Model saved successfully with {len(self._station_id_to_index)} stations")
 
     def load(self, path: str) -> None:
+        logger.info(f"Loading GRU-D model from: {path}")
         meta_path = os.path.join(path, "metadata.joblib")
         model_path = os.path.join(path, "model.pt")
         if not os.path.exists(meta_path) or not os.path.exists(model_path):
             raise FileNotFoundError(f"Missing model files in {path}")
 
         metadata = joblib.load(meta_path)
+        logger.info(f"  - Loaded metadata from {meta_path}")
+        
         self.history_steps = int(metadata["history_steps"])
         self.horizon_steps = int(metadata["horizon_steps"])
         self.station_embedding_dim = int(metadata["station_embedding_dim"])
@@ -742,6 +785,8 @@ class GRUDModel(ModelInterface):
         station_count = (
             len(self._station_id_to_index) if self._station_id_to_index else 0
         )
+        
+        logger.info(f"  - Model config: hidden_size={self.hidden_size}, num_layers={self.num_layers}, stations={station_count}")
 
         self._model = _GRUDHead(
             input_dim=feature_dim,
@@ -756,6 +801,8 @@ class GRUDModel(ModelInterface):
         state_dict = torch.load(model_path, map_location=self.device)
         self._model.load_state_dict(state_dict)
         self._model.eval()
+        logger.info(f"  - Loaded model weights from {model_path}")
+        logger.info(f"Model loaded successfully (device: {self.device})")
 
     # ------------- Internal helpers -------------
     def _prepare_dataframe(
@@ -765,6 +812,8 @@ class GRUDModel(ModelInterface):
         Prepare dataframe with only wind features.
         Keep -999 for now to create masks later.
         """
+        logger.info(f"Preparing dataframe: {len(dataset)} rows, fit_scalers={fit_scalers}")
+        
         required_cols = [
             "station_id",
             "record_date",
@@ -794,6 +843,7 @@ class GRUDModel(ModelInterface):
         if fit_scalers or self._station_id_to_index is None:
             station_ids = [str(s) for s in pd.unique(df["station_id"])]
             self._station_id_to_index = {sid: i for i, sid in enumerate(station_ids)}
+            logger.info(f"Station mapping created: {len(station_ids)} unique stations")
 
         # Fit or apply scalers (excluding -999 values)
         if fit_scalers or self._feature_scaler is None or self._target_scaler is None:
@@ -802,13 +852,19 @@ class GRUDModel(ModelInterface):
 
             # Fit on non-missing values only
             valid_mask = (df["u"] != -999) & (df["v"] != -999)
-            if valid_mask.sum() > 0:
-                self._feature_scaler.fit(
-                    df.loc[valid_mask, ["u", "v"]].to_numpy(dtype=float)
-                )
-                self._target_scaler.fit(
-                    df.loc[valid_mask, ["u", "v"]].to_numpy(dtype=float)
-                )
+            valid_count = valid_mask.sum()
+            missing_count = len(df) - valid_count
+            missing_pct = 100.0 * missing_count / len(df)
+            logger.info(f"Data quality: {valid_count} valid, {missing_count} missing ({missing_pct:.2f}%)")
+            
+            if valid_count > 0:
+                valid_data = df.loc[valid_mask, ["u", "v"]].to_numpy(dtype=float)
+                self._feature_scaler.fit(valid_data)
+                self._target_scaler.fit(valid_data)
+                
+                # Log scaler statistics
+                logger.info(f"Feature scaler - mean: u={self._feature_scaler.mean_[0]:.4f}, v={self._feature_scaler.mean_[1]:.4f}")
+                logger.info(f"Feature scaler - std: u={np.sqrt(self._feature_scaler.var_[0]):.4f}, v={np.sqrt(self._feature_scaler.var_[1]):.4f}")
             else:
                 raise ValueError("No valid data to fit scalers")
 
@@ -816,7 +872,8 @@ class GRUDModel(ModelInterface):
         df[["u", "v"]] = self._feature_scaler.transform(
             df[["u", "v"]].to_numpy(dtype=float)
         )
-
+        
+        logger.info("Dataframe preparation complete")
         return df
 
     def _prepare_grud_inputs(
@@ -863,9 +920,15 @@ class GRUDModel(ModelInterface):
         List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]],
         int,
     ]:
+        logger.info(f"Building sequences: history={self.history_steps}, horizon={self.horizon_steps}")
         sequences = []
         hist = self.history_steps
         horiz = self.horizon_steps
+        
+        total_stations = df["station_id"].nunique()
+        logger.info(f"Processing {total_stations} stations...")
+        stations_with_data = 0
+        skipped_stations = 0
 
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
@@ -874,9 +937,14 @@ class GRUDModel(ModelInterface):
             n = len(g)
 
             if n < hist + horiz:
+                skipped_stations += 1
                 continue
 
+            stations_with_data += 1
             sid_idx = self._station_id_to_index[str(station_id)]
+            
+            logger.info(f"Processing station {station_id} ({stations_with_data}/{total_stations}): {n} timesteps...")
+            station_sequences = 0
 
             for start in range(0, n - hist - horiz + 1):
                 x = features[start : start + hist]
@@ -889,10 +957,18 @@ class GRUDModel(ModelInterface):
                 x_proc, mask, delta, x_last_obs = self._prepare_grud_inputs(x)
 
                 sequences.append((x_proc, y, mask, delta, x_last_obs, sid_idx))
+                station_sequences += 1
+            
+            logger.info(f"  → Station {station_id}: created {station_sequences} sequences")
 
         station_count = (
             len(self._station_id_to_index) if self._station_id_to_index else 0
         )
+        
+        logger.info(f"Sequence building complete: {len(sequences)} sequences from {stations_with_data} stations")
+        if skipped_stations > 0:
+            logger.info(f"Skipped {skipped_stations} stations with insufficient data (< {hist + horiz} timesteps)")
+        
         return sequences, station_count
 
     def _build_sequences_train_val(
@@ -904,10 +980,16 @@ class GRUDModel(ModelInterface):
         List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]],
         int,
     ]:
+        logger.info(f"Building train/val sequences: val_fraction={val_fraction:.2%}")
         train_sequences = []
         val_sequences = []
         hist = self.history_steps
         horiz = self.horizon_steps
+        
+        total_stations = df["station_id"].nunique()
+        logger.info(f"Processing {total_stations} stations...")
+        stations_with_data = 0
+        skipped_stations = 0
 
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
@@ -916,12 +998,19 @@ class GRUDModel(ModelInterface):
             n = len(g)
 
             if n < hist + horiz:
+                skipped_stations += 1
                 continue
 
+            stations_with_data += 1
             sid_idx = self._station_id_to_index[str(station_id)]
+            
+            logger.info(f"Processing station {station_id} ({stations_with_data}/{total_stations}): {n} timesteps...")
 
             cut = int(np.floor(n * (1.0 - float(val_fraction))))
             cut = int(np.clip(cut, 0, n))
+            
+            station_train = 0
+            station_val = 0
 
             # Training sequences
             max_train_start = cut - hist - horiz
@@ -935,6 +1024,7 @@ class GRUDModel(ModelInterface):
                     train_sequences.append(
                         (x_proc, y, mask, delta, x_last_obs, sid_idx)
                     )
+                    station_train += 1
 
             # Validation sequences
             min_val_start = max(0, cut - hist)
@@ -949,8 +1039,16 @@ class GRUDModel(ModelInterface):
 
                     x_proc, mask, delta, x_last_obs = self._prepare_grud_inputs(x)
                     val_sequences.append((x_proc, y, mask, delta, x_last_obs, sid_idx))
+                    station_val += 1
+            
+            logger.info(f"  → Station {station_id}: created {station_train} train + {station_val} val sequences")
 
         station_count = (
             len(self._station_id_to_index) if self._station_id_to_index else 0
         )
+        
+        logger.info(f"Train/val split complete: {len(train_sequences)} train, {len(val_sequences)} val sequences from {stations_with_data} stations")
+        if skipped_stations > 0:
+            logger.info(f"Skipped {skipped_stations} stations with insufficient data (< {hist + horiz} timesteps)")
+        
         return train_sequences, val_sequences, station_count

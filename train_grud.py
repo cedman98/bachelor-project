@@ -17,7 +17,7 @@ def main():
     logger.info(f"Measurements: {len(measurements_df)} rows")
 
     # Split data at 2024-04-01
-    end_date = pd.Timestamp("2024-04-01")
+    end_date = pd.Timestamp("2025-04-01")
     train_df = measurements_df[(measurements_df["record_date"] <= end_date)].copy()
     test_df = measurements_df[measurements_df["record_date"] > end_date].copy()
 
