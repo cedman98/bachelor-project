@@ -22,13 +22,14 @@ class PersistenceModel(ModelInterface):
     - Uses last observed [speed, dir_sin, dir_cos] values and repeats them for horizon_steps
     - Minimal preprocessing: -999 sentinel to NaN, forward/backward fill per station
     - Does not require training (no parameters to learn)
-    - Uses same representation as BiLSTM: speed + direction as sin/cos components
+    - Uses same representation as PatchTST: speed + direction as sin/cos components
+    - Hourly resolution: 24 history steps (24 hours), 12 horizon steps (12 hours)
     """
 
     def __init__(
         self,
-        history_steps: int = 72,
-        horizon_steps: int = 72,
+        history_steps: int = 24,
+        horizon_steps: int = 12,
     ) -> None:
         self.history_steps = history_steps
         self.horizon_steps = horizon_steps
@@ -53,7 +54,7 @@ class PersistenceModel(ModelInterface):
         df = self._prepare_dataframe(dataset)
         
         results = []
-        freq = pd.Timedelta("10min")
+        freq = pd.Timedelta(hours=1)
         
         for station_id, group in df.groupby("station_id"):
             group = group.sort_values("record_date").reset_index(drop=True)
@@ -213,7 +214,7 @@ class PersistenceModel(ModelInterface):
     def _prepare_dataframe(self, dataset: pd.DataFrame) -> pd.DataFrame:
         """
         Prepare dataset for the persistence model.
-        Minimal preprocessing: handle -999 sentinels, compute speed/dir_sin/dir_cos, resample.
+        Minimal preprocessing: handle -999 sentinels, compute speed/dir_sin/dir_cos, resample to hourly.
         """
         required_cols = [
             "station_id",
@@ -242,13 +243,13 @@ class PersistenceModel(ModelInterface):
         direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
         speed = df["average_wind_speed"].astype(float)
         
-        # Speed and direction as sin/cos (matching BiLSTM representation)
+        # Speed and direction as sin/cos (matching PatchTST representation)
         df["speed"] = speed
         df["dir_sin"] = np.sin(direction_rad)
         df["dir_cos"] = np.cos(direction_rad)
 
-        # Resample to regular 10-minute grid per station
-        freq = "10min"
+        # Resample to regular hourly grid per station
+        freq = "1h"
 
         def resample_group(g: pd.DataFrame) -> pd.DataFrame:
             g = g.sort_values("record_date").set_index("record_date")
