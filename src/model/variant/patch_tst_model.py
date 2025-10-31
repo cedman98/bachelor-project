@@ -1,0 +1,969 @@
+import os
+from typing import Dict, List, Tuple
+
+import joblib
+import numpy as np
+import pandas as pd
+import torch
+from loguru import logger
+from omegaconf import OmegaConf
+from sklearn.preprocessing import StandardScaler
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+from src.model.variant.model_interface import ModelInterface
+
+
+class _SequenceDataset(Dataset):
+    def __init__(self, sequences: List[Tuple[np.ndarray, np.ndarray, int]]):
+        self.sequences = sequences
+
+    def __len__(self) -> int:
+        return len(self.sequences)
+
+    def __getitem__(self, idx: int):
+        x, y, station_idx = self.sequences[idx]
+        return (
+            torch.from_numpy(x).float(),
+            torch.from_numpy(y).float(),
+            torch.tensor(station_idx, dtype=torch.long),
+        )
+
+
+class _PatchEmbedding(nn.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        patch_len: int,
+        stride: int,
+        d_model: int,
+        dropout: float,
+    ) -> None:
+        super().__init__()
+        self.patch_len = patch_len
+        self.stride = stride
+        self.proj = nn.Linear(input_dim * patch_len, d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, C]
+        B, T, C = x.shape
+        num_patches = 1 + (T - self.patch_len) // self.stride
+        patches = []
+        for i in range(0, T - self.patch_len + 1, self.stride):
+            patches.append(x[:, i : i + self.patch_len, :])
+        x_p = torch.stack(patches, dim=2)  # [B, patch_len, P, C]
+        x_p = x_p.permute(0, 2, 1, 3).contiguous()  # [B, P, patch_len, C]
+        x_p = x_p.view(B, num_patches, -1)  # [B, P, patch_len*C]
+        x_emb = self.proj(x_p)  # [B, P, d_model]
+        return self.dropout(x_emb)
+
+
+class _StationEmbedding(nn.Module):
+    def __init__(self, station_count: int, d_model: int):
+        super().__init__()
+        self.emb = nn.Embedding(max(1, station_count), d_model)
+
+    def forward(self, station_idx: torch.Tensor) -> torch.Tensor:
+        return self.emb(station_idx)
+
+
+class _MultiHeadTransformer(nn.Module):
+    """
+    Multi-head transformer with separate prediction heads for speed and direction.
+    Shared encoder, separate decoders for speed and direction (sin, cos).
+    """
+    def __init__(
+        self,
+        input_dim: int,
+        patch_len: int,
+        stride: int,
+        d_model: int,
+        nhead: int,
+        num_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        horizon_steps: int,
+        station_count: int,
+    ) -> None:
+        super().__init__()
+        self.horizon_steps = horizon_steps
+        
+        # Shared patch embedding and transformer encoder
+        self.patch_embed = _PatchEmbedding(
+            input_dim=input_dim,
+            patch_len=patch_len,
+            stride=stride,
+            d_model=d_model,
+            dropout=dropout,
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True,
+            activation="gelu",
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.station_emb = _StationEmbedding(station_count, d_model)
+        
+        # Separate prediction heads
+        # Speed head (1 value per timestep)
+        self.speed_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, horizon_steps),
+        )
+        
+        # Direction head (2 values per timestep: sin, cos)
+        self.direction_head = nn.Sequential(
+            nn.Linear(d_model, d_model // 2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model // 2, horizon_steps * 2),
+        )
+
+    def forward(self, x: torch.Tensor, station_idx: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, C]
+        z = self.patch_embed(x)  # [B, P, d_model]
+        # Add station embedding as a CLS-like token
+        s = self.station_emb(station_idx)  # [B, d_model]
+        s = s.unsqueeze(1)  # [B, 1, d_model]
+        z = torch.cat([s, z], dim=1)  # [B, 1+P, d_model]
+        z = self.encoder(z)  # [B, 1+P, d_model]
+        cls = z[:, 0, :]  # [B, d_model]
+        
+        # Predict speed and direction separately
+        speed = self.speed_head(cls)  # [B, H]
+        direction = self.direction_head(cls)  # [B, H*2]
+        
+        # Reshape and combine: [B, H, 3] where 3 = [speed, dir_sin, dir_cos]
+        B, H = speed.shape
+        speed = speed.unsqueeze(-1)  # [B, H, 1]
+        direction = direction.view(B, H, 2)  # [B, H, 2]
+        
+        return torch.cat([speed, direction], dim=-1)  # [B, H, 3]
+
+
+class PatchTSTModel(ModelInterface):
+    """
+    PatchTST-style transformer model for hourly wind forecasting with multi-head architecture.
+
+    - Uses last 24h (24 steps) of context to predict next 12h (12 steps) of speed and direction.
+    - Features: wind speed, direction (sin/cos), and cyclical time encodings (hour, day of week, month, day of year).
+    - Multi-head architecture: separate prediction heads for speed and direction.
+    - No weather features - purely wind and temporal patterns.
+    - Handles multi-station data with a learned station embedding.
+    - Robust preprocessing: -999 sentinel to NaN, forward/back fill per station, hourly resample.
+    - Scaling for speed and targets persisted with the model.
+    """
+
+    def __init__(
+        self,
+        cfg: OmegaConf | None = None,
+        history_steps: int = 24,
+        horizon_steps: int = 12,
+        station_embedding_dim: int = 0,  # not used directly; station token used instead
+        d_model: int = 256,
+        nhead: int = 8,
+        num_layers: int = 4,
+        dim_feedforward: int = 512,
+        patch_len: int = 16,
+        stride: int = 8,
+        dropout: float = 0.1,
+        batch_size: int = 64,
+        learning_rate: float = 3e-4,
+        num_epochs: int = 10,
+        num_workers: int = 0,
+        device: str | None = None,
+        val_split: float = 0.1,
+        early_stopping_patience: int = 5,
+        early_stopping_min_delta: float = 1e-4,
+        restore_best_weights: bool = True,
+        shuffle_train: bool = True,
+        diff_loss_weight: float = 0.2,
+        tv_loss_weight: float = 0.05,
+    ) -> None:
+        self.cfg = cfg
+        self.history_steps = history_steps
+        self.horizon_steps = horizon_steps
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.patch_len = patch_len
+        self.stride = stride
+        self.dropout = dropout
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.num_epochs = num_epochs
+        self.num_workers = num_workers
+        if device is None:
+            if torch.cuda.is_available():
+                self.device = "cuda"
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                self.device = "mps"
+            else:
+                self.device = "cpu"
+        else:
+            self.device = device
+        self.val_split = float(val_split)
+        self.early_stopping_patience = int(early_stopping_patience)
+        self.early_stopping_min_delta = float(early_stopping_min_delta)
+        self.restore_best_weights = bool(restore_best_weights)
+        self.shuffle_train = bool(shuffle_train)
+        # Smoothness regularization weights (encourage temporal consistency across horizon)
+        self.diff_loss_weight = float(diff_loss_weight)
+        self.tv_loss_weight = float(tv_loss_weight)
+
+        self._model: _MultiHeadTransformer | None = None
+        self._feature_columns: List[str] | None = None
+        # Predict average_wind_speed (scaled) and direction via sin/cos (no scaling): [speed, dir_sin, dir_cos]
+        self._target_columns: List[str] = ["speed", "dir_sin", "dir_cos"]
+        self._feature_scaler: StandardScaler | None = None
+        self._target_scaler: StandardScaler | None = None
+        self._station_id_to_index: Dict[str, int] | None = None
+        self._output_dim_per_step: int = 3
+
+    # -------- Public API --------
+    def train(self, dataset: pd.DataFrame) -> None:
+        df = self._prepare_dataframe(dataset)
+        train_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
+        val_sequences: List[Tuple[np.ndarray, np.ndarray, int]]
+        if self.val_split and self.val_split > 0.0:
+            train_sequences, val_sequences, num_stations = (
+                self._build_sequences_train_val(df, self.val_split)
+            )
+        else:
+            sequences, num_stations = self._build_sequences(df)
+            train_sequences = sequences
+            val_sequences = []
+
+        if len(train_sequences) == 0:
+            raise ValueError("No training sequences could be constructed. Ensure sufficient history per station.")
+
+        feature_dim = len(self._feature_columns)
+        logger.info(
+            f"PatchTST: train_sequences={len(train_sequences)}, val_sequences={len(val_sequences)}, stations={num_stations}, feature_dim={feature_dim}, device={self.device}"
+        )
+
+        self._model = _MultiHeadTransformer(
+            input_dim=feature_dim,
+            patch_len=self.patch_len,
+            stride=self.stride,
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_layers=self.num_layers,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            horizon_steps=self.horizon_steps,
+            station_count=num_stations,
+        ).to(self.device)
+
+        train_ds = _SequenceDataset(train_sequences)
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=self.batch_size,
+            shuffle=self.shuffle_train,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+        val_loader: DataLoader | None = None
+        if len(val_sequences) > 0:
+            val_ds = _SequenceDataset(val_sequences)
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers,
+                pin_memory=(self.device == "cuda"),
+            )
+
+        optimizer = torch.optim.AdamW(self._model.parameters(), lr=self.learning_rate, weight_decay=1e-4)
+        loss_fn = nn.MSELoss()
+
+        best_val_loss = float("inf")
+        best_state_dict: Dict[str, torch.Tensor] | None = None
+        epochs_no_improve = 0
+
+        self._model.train()
+        num_batches = len(train_loader)
+        for epoch in range(self.num_epochs):
+            logger.info(
+                f"Epoch {epoch + 1}/{self.num_epochs} starting (lr={optimizer.param_groups[0]['lr']:.3e})"
+            )
+            epoch_loss = 0.0
+            log_every = max(1, num_batches // 10) if num_batches > 0 else 1
+            for batch_idx, (xb, yb, sb) in enumerate(train_loader, start=1):
+                non_block = self.device == "cuda"
+                # Skip batch if it contains non-finite values
+                if not (torch.isfinite(xb).all() and torch.isfinite(yb).all()):
+                    continue
+                xb = xb.to(self.device, non_blocking=non_block)
+                yb = yb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
+
+                optimizer.zero_grad(set_to_none=True)
+                preds = self._model(xb, sb)
+                if not torch.isfinite(preds).all():
+                    continue
+                loss = loss_fn(preds, yb)
+                # Add temporal smoothness regularization across the prediction horizon
+                if (self.diff_loss_weight > 0.0 or self.tv_loss_weight > 0.0) and preds.size(1) > 1:
+                    smooth_loss = self._compute_smoothing_loss(preds, yb)
+                    loss = loss + smooth_loss
+                if not torch.isfinite(loss):
+                    continue
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self._model.parameters(), 1.0)
+                optimizer.step()
+
+                epoch_loss += float(loss.detach().cpu().item()) * xb.size(0)
+
+                if batch_idx % log_every == 0 or batch_idx == num_batches:
+                    logger.info(
+                        f"Epoch {epoch + 1} [{batch_idx}/{num_batches}] batch_loss={loss.item():.6f}"
+                    )
+
+            epoch_loss /= max(1, len(train_ds))
+            logger.info(f"PatchTST epoch {epoch + 1}/{self.num_epochs} - loss={epoch_loss:.6f}")
+
+            # Validation and early stopping
+            if val_loader is not None:
+                self._model.eval()
+                val_total = 0.0
+                val_count = 0
+                with torch.no_grad():
+                    for xb, yb, sb in val_loader:
+                        non_block = self.device == "cuda"
+                        xb = xb.to(self.device, non_blocking=non_block)
+                        yb = yb.to(self.device, non_blocking=non_block)
+                        sb = sb.to(self.device, non_blocking=non_block)
+                        preds = self._model(xb, sb)
+                        vloss = loss_fn(preds, yb)
+                        val_total += float(vloss.detach().cpu().item()) * xb.size(0)
+                        val_count += xb.size(0)
+                val_loss = val_total / max(1, val_count)
+                logger.info(f"PatchTST epoch {epoch + 1}/{self.num_epochs} - val_loss={val_loss:.6f}")
+
+                improved = (best_val_loss - val_loss) > self.early_stopping_min_delta
+                if improved:
+                    best_val_loss = val_loss
+                    best_state_dict = {k: v.detach().cpu().clone() for k, v in self._model.state_dict().items()}
+                    epochs_no_improve = 0
+                else:
+                    epochs_no_improve += 1
+                    if self.early_stopping_patience > 0 and epochs_no_improve >= self.early_stopping_patience:
+                        logger.info(
+                            f"Early stopping triggered at epoch {epoch + 1}: no improvement in {self.early_stopping_patience} epoch(s)."
+                        )
+                        break
+                self._model.train()
+
+        if best_state_dict is not None and self.restore_best_weights:
+            self._model.load_state_dict(best_state_dict)
+
+    def predict(self, dataset: pd.DataFrame) -> pd.DataFrame:
+        if self._model is None:
+            raise ValueError("Model not trained. Call train() first or load a saved model.")
+        df = self._prepare_dataframe(dataset, fit_scalers=False)
+        results: List[pd.DataFrame] = []
+        freq = pd.Timedelta(hours=1)
+        for station_id, g in df.groupby("station_id", sort=False):
+            g = g.sort_values("record_date")
+            if len(g) < self.history_steps:
+                continue
+            hist = g.tail(self.history_steps)
+            x_np = hist[self._feature_columns].to_numpy(dtype=float)
+            non_block = self.device == "cuda" and torch.cuda.is_available()
+            x_t = torch.from_numpy(x_np).float()
+            if non_block:
+                x_t = x_t.pin_memory()
+            x = x_t.unsqueeze(0).to(self.device, non_blocking=non_block)
+
+            mapped_idx = 0
+            if self._station_id_to_index is not None:
+                mapped_idx = int(self._station_id_to_index.get(str(station_id), 0))
+            sid_cpu = torch.tensor([mapped_idx], dtype=torch.long)
+            if non_block:
+                sid_cpu = sid_cpu.pin_memory()
+            sid_idx = sid_cpu.to(self.device, non_blocking=non_block)
+
+            self._model.eval()
+            with torch.no_grad():
+                y_scaled = self._model(x, sid_idx).squeeze(0).cpu().numpy()  # [H, 3]
+
+            # Inverse scale speed; normalize and decode direction from sin/cos
+            speed_scaled = y_scaled[:, 0:1]
+            dir_sin = y_scaled[:, 1]
+            dir_cos = y_scaled[:, 2]
+            speed_inv = self._target_scaler.inverse_transform(speed_scaled).reshape(-1)
+            norm = np.sqrt(dir_sin**2 + dir_cos**2) + 1e-8
+            dir_sin_n = dir_sin / norm
+            dir_cos_n = dir_cos / norm
+
+            last_ts = pd.to_datetime(hist.iloc[-1]["record_date"])
+            future_index = [last_ts + freq * (i + 1) for i in range(self.horizon_steps)]
+
+            # decode coming-from direction in degrees
+            direction_vals = (np.degrees(np.arctan2(dir_sin_n, dir_cos_n)) % 360.0)
+
+            out_df = pd.DataFrame(
+                {
+                    "station_id": station_id,
+                    "record_date": future_index,
+                    "average_wind_speed_pred": speed_inv,
+                    "average_wind_direction_pred": direction_vals,
+                }
+            )
+            results.append(out_df)
+
+        if not results:
+            raise ValueError("No stations had sufficient history for prediction.")
+        return pd.concat(results, axis=0).reset_index(drop=True)
+
+    def evaluate(self, dataset: pd.DataFrame, max_batches: int | None = None) -> Dict[str, float]:
+        if self._model is None:
+            raise ValueError("Model not trained. Call train() first or load a saved model.")
+        if self._feature_scaler is None or self._target_scaler is None:
+            raise ValueError("Scalers not available. Train or load a model with scalers.")
+
+        df = self._prepare_dataframe(dataset, fit_scalers=False)
+        sequences, _ = self._build_sequences(df)
+        if len(sequences) == 0:
+            raise ValueError("No evaluation sequences could be constructed. Ensure sufficient history per station.")
+
+        eval_ds = _SequenceDataset(sequences)
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+
+        num_batches = len(eval_loader)
+        logger.info(
+            f"Evaluation: samples={len(eval_ds)}, batch_size={self.batch_size}, batches={num_batches}"
+        )
+
+        self._model.eval()
+        non_block = self.device == "cuda" and torch.cuda.is_available()
+
+        preds_speed: List[np.ndarray] = []
+        trues_speed: List[np.ndarray] = []
+        preds_dir_deg: List[np.ndarray] = []
+        trues_dir_deg: List[np.ndarray] = []
+
+        with torch.no_grad():
+            for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
+                xb = xb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
+
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
+
+                B, H, _ = y_pred_scaled.shape
+                # Inverse speed scaling
+                speed_pred = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                speed_true = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+
+                # Decode directions
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                pred_dir = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
+                true_dir = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+
+                preds_speed.append(speed_pred.reshape(-1))
+                trues_speed.append(speed_true.reshape(-1))
+                preds_dir_deg.append(pred_dir.reshape(-1))
+                trues_dir_deg.append(true_dir.reshape(-1))
+
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+        speed_pred_all = np.concatenate(preds_speed)
+        speed_true_all = np.concatenate(trues_speed)
+        dir_pred_all = np.concatenate(preds_dir_deg)
+        dir_true_all = np.concatenate(trues_dir_deg)
+
+        mae_speed = float(np.mean(np.abs(speed_pred_all - speed_true_all)))
+        rmse_speed = float(np.sqrt(np.mean((speed_pred_all - speed_true_all) ** 2)))
+
+        def angular_mae_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
+            diff = np.abs(((a_deg - b_deg + 180.0) % 360.0) - 180.0)
+            return float(np.mean(diff))
+
+        mae_direction_deg = angular_mae_deg(dir_pred_all, dir_true_all)
+
+        metrics = {
+            "mae_speed": mae_speed,
+            "rmse_speed": rmse_speed,
+            "mae_direction_deg": mae_direction_deg,
+        }
+        logger.info(
+            "Evaluation metrics: "
+            + ", ".join(
+                [
+                    f"mae_speed={mae_speed:.4f}",
+                    f"rmse_speed={rmse_speed:.4f}",
+                    f"mae_direction_deg={mae_direction_deg:.2f}°",
+                ]
+            )
+        )
+        return metrics
+
+    def evaluate_per_horizon(
+        self, dataset: pd.DataFrame, save_dir: str | None = None, max_batches: int | None = None
+    ) -> Dict[str, List[float]]:
+        if self._model is None:
+            raise ValueError("Model not trained. Call train() first or load a saved model.")
+        if self._feature_scaler is None or self._target_scaler is None:
+            raise ValueError("Scalers not available. Train or load a model with scalers.")
+
+        df = self._prepare_dataframe(dataset, fit_scalers=False)
+        sequences, _ = self._build_sequences(df)
+        if len(sequences) == 0:
+            raise ValueError("No evaluation sequences could be constructed. Ensure sufficient history per station.")
+
+        eval_ds = _SequenceDataset(sequences)
+        eval_loader = DataLoader(
+            eval_ds,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
+        )
+
+        H = self.horizon_steps
+        sum_abs_speed = np.zeros(H, dtype=float)
+        sum_sq_speed = np.zeros(H, dtype=float)
+        sum_abs_dir = np.zeros(H, dtype=float)
+        count = np.zeros(H, dtype=float)
+
+        self._model.eval()
+        non_block = self.device == "cuda" and torch.cuda.is_available()
+
+        def angular_error_deg(pred_deg: np.ndarray, true_deg: np.ndarray) -> np.ndarray:
+            return np.abs(((pred_deg - true_deg + 180.0) % 360.0) - 180.0)
+
+        with torch.no_grad():
+            for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
+                xb = xb.to(self.device, non_blocking=non_block)
+                sb = sb.to(self.device, non_blocking=non_block)
+
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
+
+                B, H_, _ = y_pred_scaled.shape
+                assert H_ == H
+
+                sp_p = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                sp_t = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+
+                abs_sp = np.abs(sp_p - sp_t).sum(axis=0)
+                sq_sp = ((sp_p - sp_t) ** 2).sum(axis=0)
+
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                dir_p = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
+                dir_t = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+                diff_dir = angular_error_deg(dir_p, dir_t).sum(axis=0)
+
+                sum_abs_speed += abs_sp
+                sum_sq_speed += sq_sp
+                sum_abs_dir += diff_dir
+                count += float(B)
+
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+        count = np.maximum(count, 1.0)
+
+        mae_speed = (sum_abs_speed / count).tolist()
+        rmse_speed = np.sqrt(sum_sq_speed / count).tolist()
+        mae_direction_deg = (sum_abs_dir / count).tolist()
+
+        metrics: Dict[str, List[float]] = {
+            "mae_speed": mae_speed,
+            "rmse_speed": rmse_speed,
+            "mae_direction_deg": mae_direction_deg,
+        }
+
+        logger.info("Computed per-horizon metrics for 1..%d steps", H)
+
+        if save_dir is not None:
+            try:
+                import importlib
+                os.makedirs(save_dir, exist_ok=True)
+                plt = importlib.import_module("matplotlib.pyplot")
+                horizons = np.arange(1, H + 1)
+
+                fig1 = plt.figure(figsize=(10, 6))
+                plt.plot(horizons, mae_speed, label="MAE speed")
+                plt.plot(horizons, rmse_speed, label="RMSE speed")
+                plt.xlabel("Horizon (hours)")
+                plt.ylabel("Error")
+                plt.title("Per-horizon errors: speed")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                fig1.tight_layout()
+                fig1.savefig(os.path.join(save_dir, "per_horizon_speed.png"), dpi=150)
+                plt.close(fig1)
+
+                fig2 = plt.figure(figsize=(10, 4))
+                plt.plot(horizons, mae_direction_deg, label="MAE direction (deg)")
+                plt.xlabel("Horizon (hours)")
+                plt.ylabel("Degrees")
+                plt.title("Per-horizon direction error")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                fig2.tight_layout()
+                fig2.savefig(os.path.join(save_dir, "per_horizon_direction.png"), dpi=150)
+                plt.close(fig2)
+            except Exception as e:
+                logger.warning(f"Could not generate plots: {e}")
+
+        return metrics
+
+    def save(self, path: str) -> None:
+        if self._model is None:
+            raise ValueError("Model not trained. Call train() first.")
+        os.makedirs(path, exist_ok=True)
+        torch.save(self._model.state_dict(), os.path.join(path, "model.pt"))
+        metadata = {
+            "history_steps": self.history_steps,
+            "horizon_steps": self.horizon_steps,
+            "d_model": self.d_model,
+            "nhead": self.nhead,
+            "num_layers": self.num_layers,
+            "dim_feedforward": self.dim_feedforward,
+            "patch_len": self.patch_len,
+            "stride": self.stride,
+            "dropout": self.dropout,
+            "val_split": self.val_split,
+            "early_stopping_patience": self.early_stopping_patience,
+            "early_stopping_min_delta": self.early_stopping_min_delta,
+            "restore_best_weights": self.restore_best_weights,
+            "batch_size": self.batch_size,
+            "learning_rate": self.learning_rate,
+            "num_epochs": self.num_epochs,
+            "num_workers": self.num_workers,
+            "shuffle_train": self.shuffle_train,
+            "diff_loss_weight": self.diff_loss_weight,
+            "tv_loss_weight": self.tv_loss_weight,
+            "feature_columns": self._feature_columns,
+            "target_columns": self._target_columns,
+            "station_id_to_index": self._station_id_to_index,
+            "feature_scaler": self._feature_scaler,
+            "target_scaler": self._target_scaler,
+        }
+        joblib.dump(metadata, os.path.join(path, "metadata.joblib"))
+
+    def load(self, path: str) -> None:
+        meta_path = os.path.join(path, "metadata.joblib")
+        model_path = os.path.join(path, "model.pt")
+        if not os.path.exists(meta_path) or not os.path.exists(model_path):
+            raise FileNotFoundError(f"Missing model files in {path}")
+        metadata = joblib.load(meta_path)
+        self.history_steps = int(metadata["history_steps"])
+        self.horizon_steps = int(metadata["horizon_steps"])
+        self.d_model = int(metadata["d_model"])
+        self.nhead = int(metadata["nhead"])
+        self.num_layers = int(metadata["num_layers"])
+        self.dim_feedforward = int(metadata["dim_feedforward"])
+        self.patch_len = int(metadata["patch_len"])
+        self.stride = int(metadata["stride"])
+        self.dropout = float(metadata["dropout"])
+        self.val_split = float(metadata.get("val_split", 0.0))
+        self.early_stopping_patience = int(metadata.get("early_stopping_patience", 0))
+        self.early_stopping_min_delta = float(metadata.get("early_stopping_min_delta", 0.0))
+        self.restore_best_weights = bool(metadata.get("restore_best_weights", True))
+        self.batch_size = int(metadata.get("batch_size", self.batch_size))
+        self.learning_rate = float(metadata.get("learning_rate", self.learning_rate))
+        self.num_epochs = int(metadata.get("num_epochs", self.num_epochs))
+        self.num_workers = int(metadata.get("num_workers", self.num_workers))
+        self.shuffle_train = bool(metadata.get("shuffle_train", self.shuffle_train))
+        self.diff_loss_weight = float(metadata.get("diff_loss_weight", getattr(self, "diff_loss_weight", 0.2)))
+        self.tv_loss_weight = float(metadata.get("tv_loss_weight", getattr(self, "tv_loss_weight", 0.05)))
+        self._feature_columns = list(metadata["feature_columns"])  # type: ignore[arg-type]
+        self._target_columns = list(metadata["target_columns"])  # type: ignore[arg-type]
+        self._station_id_to_index = dict(metadata["station_id_to_index"])  # type: ignore[arg-type]
+        self._feature_scaler = metadata["feature_scaler"]
+        self._target_scaler = metadata["target_scaler"]
+        # Backward compatibility: set output dim
+        self._output_dim_per_step = 3 if self._target_columns == ["speed", "dir_sin", "dir_cos"] else 2
+
+        feature_dim = len(self._feature_columns)
+        station_count = len(self._station_id_to_index) if self._station_id_to_index else 0
+        self._model = _MultiHeadTransformer(
+            input_dim=feature_dim,
+            patch_len=self.patch_len,
+            stride=self.stride,
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_layers=self.num_layers,
+            dim_feedforward=self.dim_feedforward,
+            dropout=self.dropout,
+            horizon_steps=self.horizon_steps,
+            station_count=station_count,
+        ).to(self.device)
+        state_dict = torch.load(model_path, map_location=self.device)
+        self._model.load_state_dict(state_dict)
+        self._model.eval()
+
+    # -------- Internal helpers --------
+    def _compute_smoothing_loss(self, preds: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
+        """
+        Encourage temporal smoothness and realistic dynamics over the horizon.
+
+        - Difference-alignment loss: penalize mismatch in first differences of predictions
+          versus ground truth across the horizon (MSE on deltas).
+        - Total-variation loss: penalize large consecutive-step jumps in predictions (L1 on deltas).
+
+        Both operate across all output channels [speed, dir_sin, dir_cos].
+        """
+        try:
+            # preds, y_true: [B, H, C]
+            diff_pred = preds[:, 1:, :] - preds[:, :-1, :]
+            diff_true = y_true[:, 1:, :] - y_true[:, :-1, :]
+            diff_mse = torch.mean((diff_pred - diff_true) ** 2)
+            tv_l1 = torch.mean(torch.abs(diff_pred))
+            loss = self.diff_loss_weight * diff_mse + self.tv_loss_weight * tv_l1
+            if not torch.isfinite(loss):
+                return torch.zeros((), dtype=preds.dtype, device=preds.device)
+            return loss
+        except Exception:
+            # Be conservative: never break training due to auxiliary loss
+            return torch.zeros((), dtype=preds.dtype, device=preds.device)
+    def _prepare_dataframe(self, dataset: pd.DataFrame, fit_scalers: bool = True) -> pd.DataFrame:
+        required_cols = [
+            "station_id",
+            "record_date",
+            "average_wind_speed",
+            "average_wind_direction",
+        ]
+        missing = [c for c in required_cols if c not in dataset.columns]
+        if missing:
+            raise ValueError(f"Dataset missing required columns: {missing}")
+
+        df = dataset.copy()
+        if not pd.api.types.is_datetime64_any_dtype(df["record_date"]):
+            df["record_date"] = pd.to_datetime(df["record_date"], errors="coerce", utc=False)
+
+        # Replace sentinel -999 with NaN in wind columns
+        df["average_wind_speed"] = df["average_wind_speed"].replace(-999, np.nan)
+        df["average_wind_direction"] = df["average_wind_direction"].replace(-999, np.nan)
+
+        # Create derived columns for modeling
+        # Convert direction to radians and create sin/cos encodings
+        direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
+        speed = df["average_wind_speed"].astype(float)
+        
+        # Features and targets: speed (scaled) and direction as sin/cos (unscaled)
+        df["speed"] = speed
+        df["dir_sin"] = np.sin(direction_rad)
+        df["dir_cos"] = np.cos(direction_rad)
+
+        # Add cyclical time features
+        # Hour of day (0-23) encoded as sin/cos
+        df["hour"] = df["record_date"].dt.hour
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+        
+        # Day of week (0-6) encoded as sin/cos
+        df["day_of_week"] = df["record_date"].dt.dayofweek
+        df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+        df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+        
+        # Month (1-12) encoded as sin/cos
+        df["month"] = df["record_date"].dt.month
+        df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12)
+        df["month_cos"] = np.cos(2 * np.pi * (df["month"] - 1) / 12)
+        
+        # Day of year (1-365/366) encoded as sin/cos for seasonality
+        df["day_of_year"] = df["record_date"].dt.dayofyear
+        df["day_of_year_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
+        df["day_of_year_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
+
+        # Resample to regular hourly grid per station and forward/back-fill
+        freq = "1h"
+        def resample_group(g: pd.DataFrame) -> pd.DataFrame:
+            g = g.sort_values("record_date").set_index("record_date")
+            g = g.asfreq(freq)
+            # Fill wind-derived features
+            wind_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+            g[wind_cols] = g[wind_cols].ffill().bfill()
+            # Keep station_id
+            g["station_id"] = g["station_id"].ffill().bfill()
+            # Regenerate time features after resampling (they may have gaps)
+            g = g.reset_index()
+            g["hour"] = g["record_date"].dt.hour
+            g["hour_sin"] = np.sin(2 * np.pi * g["hour"] / 24)
+            g["hour_cos"] = np.cos(2 * np.pi * g["hour"] / 24)
+            g["day_of_week"] = g["record_date"].dt.dayofweek
+            g["day_of_week_sin"] = np.sin(2 * np.pi * g["day_of_week"] / 7)
+            g["day_of_week_cos"] = np.cos(2 * np.pi * g["day_of_week"] / 7)
+            g["month"] = g["record_date"].dt.month
+            g["month_sin"] = np.sin(2 * np.pi * (g["month"] - 1) / 12)
+            g["month_cos"] = np.cos(2 * np.pi * (g["month"] - 1) / 12)
+            g["day_of_year"] = g["record_date"].dt.dayofyear
+            g["day_of_year_sin"] = np.sin(2 * np.pi * g["day_of_year"] / 365.25)
+            g["day_of_year_cos"] = np.cos(2 * np.pi * g["day_of_year"] / 365.25)
+            return g
+
+        df = (
+            df.groupby("station_id", group_keys=False, sort=False)
+            .apply(resample_group)
+            .reset_index(drop=True)
+        )
+
+        # After resampling and fills, apply global mean fill for any residual NaNs in wind data
+        wind_and_target_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(
+            df[wind_and_target_cols].mean(numeric_only=True)
+        )
+
+        # Drop rows with missing targets as a last resort
+        df = df.dropna(subset=["speed", "dir_sin", "dir_cos"])
+
+        # Replace any remaining inf/-inf with NaN then fill with zeros
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(0.0)
+
+        # Ensure ordering
+        df = df.sort_values(["station_id", "record_date"]).reset_index(drop=True)
+
+        # Select features: wind speed, direction (sin/cos) and cyclical time features
+        feature_cols = [
+            "speed",
+            "dir_sin",
+            "dir_cos",
+            "hour_sin",
+            "hour_cos",
+            "day_of_week_sin",
+            "day_of_week_cos",
+            "month_sin",
+            "month_cos",
+            "day_of_year_sin",
+            "day_of_year_cos",
+        ]
+        self._feature_columns = feature_cols if self._feature_columns is None else self._feature_columns
+
+        # Station mapping
+        if fit_scalers or self._station_id_to_index is None:
+            station_ids = [str(s) for s in pd.unique(df["station_id"]) if pd.notna(s)]
+            self._station_id_to_index = {sid: i for i, sid in enumerate(station_ids)}
+
+        # Fit/apply scalers
+        if fit_scalers or self._feature_scaler is None or self._target_scaler is None:
+            self._feature_scaler = StandardScaler()
+            self._target_scaler = StandardScaler()
+            # Scale only speed; direction sin/cos and time features are already in bounded ranges
+            self._feature_scaler.fit(df[["speed"]].to_numpy(dtype=float))
+            # Target scaler is same as feature scaler for speed (they share the same scaler)
+            self._target_scaler = self._feature_scaler
+            # Guard against zero-variance leading to div-by-zero
+            if hasattr(self._feature_scaler, "scale_"):
+                with np.errstate(invalid="ignore"):
+                    self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = 1.0
+
+        # Scale speed in features (same scaler for input and output speed)
+        df[["speed"]] = self._feature_scaler.transform(df[["speed"]].to_numpy(dtype=float))
+
+        # Safety: ensure no NaNs/Infs after scaling
+        df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
+        df[["speed", "dir_sin", "dir_cos"]] = np.nan_to_num(
+            df[["speed", "dir_sin", "dir_cos"]], nan=0.0, posinf=0.0, neginf=0.0
+        )
+        # Clip to a reasonable range to avoid exploding activations
+        # Speed after scaling
+        df[["speed"]] = df[["speed"]].clip(lower=-10.0, upper=10.0)
+        # Direction features are already in [-1, 1]
+        df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(lower=-1.0, upper=1.0)
+        # Time features are already in [-1, 1] so clip them conservatively
+        time_features = ["hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
+                         "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos"]
+        df[time_features] = df[time_features].clip(lower=-1.1, upper=1.1)
+
+        return df
+
+    def _build_sequences(self, df: pd.DataFrame) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], int]:
+        sequences: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        hist = self.history_steps
+        horiz = self.horizon_steps
+        for station_id, g in df.groupby("station_id", sort=False):
+            g = g.sort_values("record_date")
+            features = g[self._feature_columns].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
+            n = len(g)
+            if n < hist + horiz:
+                continue
+            sid_idx = self._station_id_to_index[str(station_id)]  # type: ignore[index]
+            for start in range(0, n - hist - horiz + 1):
+                x = features[start : start + hist]
+                y = targets[start + hist : start + hist + horiz]
+                # Skip sequences that contain non-finite values
+                if not (np.isfinite(x).all() and np.isfinite(y).all()):
+                    continue
+                sequences.append((x, y, sid_idx))
+        station_count = len(self._station_id_to_index) if self._station_id_to_index else 0
+        return sequences, station_count
+
+    def _build_sequences_train_val(
+        self, df: pd.DataFrame, val_fraction: float
+    ) -> Tuple[List[Tuple[np.ndarray, np.ndarray, int]], List[Tuple[np.ndarray, np.ndarray, int]], int]:
+        train_sequences: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        val_sequences: List[Tuple[np.ndarray, np.ndarray, int]] = []
+        hist = self.history_steps
+        horiz = self.horizon_steps
+        for station_id, g in df.groupby("station_id", sort=False):
+            g = g.sort_values("record_date")
+            features = g[self._feature_columns].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
+            n = len(g)
+            if n < hist + horiz:
+                continue
+            sid_idx = self._station_id_to_index[str(station_id)]  # type: ignore[index]
+            cut = int(np.floor(n * (1.0 - float(val_fraction))))
+            cut = int(np.clip(cut, 0, n))
+
+            max_train_start = cut - hist - horiz
+            if max_train_start >= 0:
+                for start in range(0, max_train_start + 1):
+                    x = features[start : start + hist]
+                    y = targets[start + hist : start + hist + horiz]
+                    train_sequences.append((x, y, sid_idx))
+
+            min_val_start = max(0, cut - hist)
+            max_val_start = n - hist - horiz
+            if max_val_start >= min_val_start:
+                for start in range(min_val_start, max_val_start + 1):
+                    if start + hist < cut:
+                        continue
+                    x = features[start : start + hist]
+                    y = targets[start + hist : start + hist + horiz]
+                    val_sequences.append((x, y, sid_idx))
+
+        station_count = len(self._station_id_to_index) if self._station_id_to_index else 0
+        return train_sequences, val_sequences, station_count
+

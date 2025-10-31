@@ -20,7 +20,7 @@ class _SequenceDataset(Dataset):
 
     Each sample consists of:
     - X: [history_steps, feature_dim]
-    - y: [horizon_steps, 2] where the two targets are [u, v]
+    - y: [horizon_steps, 3] where the three targets are [speed, dir_sin, dir_cos]
     - station_index: int index for an embedding lookup
     """
 
@@ -45,7 +45,7 @@ class _SequenceDataset(Dataset):
 class _BiLSTMHead(nn.Module):
     """
     A bidirectional LSTM encoder that maps a history window to a fixed representation,
-    followed by a feedforward projection to a multi-step horizon for two targets (u, v).
+    followed by a feedforward projection to a multi-step horizon for three targets (speed, dir_sin, dir_cos).
     """
 
     def __init__(
@@ -57,8 +57,10 @@ class _BiLSTMHead(nn.Module):
         horizon_steps: int,
         station_count: int,
         station_embedding_dim: int,
+        output_dim_per_step: int = 3,
     ) -> None:
         super().__init__()
+        self.output_dim_per_step = output_dim_per_step
         self.station_embedding = (
             nn.Embedding(station_count, station_embedding_dim)
             if station_count > 0 and station_embedding_dim > 0
@@ -81,7 +83,7 @@ class _BiLSTMHead(nn.Module):
             nn.Linear(hidden_size * 2, hidden_size * 2),
             nn.ReLU(),
             nn.Dropout(p=dropout),
-            nn.Linear(hidden_size * 2, horizon_steps * 2),  # 2 targets: u & v
+            nn.Linear(hidden_size * 2, horizon_steps * output_dim_per_step),
         )
 
     def forward(self, x: torch.Tensor, station_idx: torch.Tensor) -> torch.Tensor:
@@ -91,7 +93,7 @@ class _BiLSTMHead(nn.Module):
             station_idx: [batch]
 
         Returns:
-            predictions: [batch, horizon_steps, 2]
+            predictions: [batch, horizon_steps, output_dim_per_step]
         """
         if self.station_embedding is not None:
             emb = self.station_embedding(station_idx)  # [batch, emb_dim]
@@ -106,29 +108,32 @@ class _BiLSTMHead(nn.Module):
         h_forward = h_n[-2]
         h_backward = h_n[-1]
         h = torch.cat([h_forward, h_backward], dim=-1)  # [batch, hidden*2]
-        out = self.proj(h)  # [batch, horizon*2]
-        return out.view(x.size(0), -1, 2)
+        out = self.proj(h)  # [batch, horizon*output_dim]
+        return out.view(x.size(0), -1, self.output_dim_per_step)
 
 
 class BiLSTMModel(ModelInterface):
     """
-    Bidirectional LSTM model for multi-station, multi-step forecasting of wind vector components.
+    Bidirectional LSTM model for multi-station, multi-step forecasting of wind speed and direction.
 
-    - Input data: 10-minute resolution time series with columns defined by the user.
-    - Targets: next 12 hours (72 steps) of [u, v] where
-      u = -speed * sin(direction_rad), v = -speed * cos(direction_rad)
+    - Input data: hourly resolution time series with columns defined by the user.
+    - Uses last 24h (24 steps) of context to predict next 12h (12 steps) of speed and direction.
+    - Features: wind speed, direction (sin/cos), and cyclical time encodings (hour, day of week, month, day of year).
+    - No weather features - purely wind and temporal patterns.
+    - Targets: next 12 hours (12 steps) of [speed, dir_sin, dir_cos] where
+      speed = average_wind_speed, dir_sin = sin(direction_rad), dir_cos = cos(direction_rad)
       using meteorological convention (coming-from direction).
     - Handles multiple stations via a learned station embedding.
-    - Drops `quality_level`.
+    - Resamples to regular hourly grid with forward/backward fill for missing values.
     - Replaces numeric sentinel -999 with NaN and imputes within-station via forward/backward fill.
-    - Standardizes features and targets; scalers are persisted with the model.
+    - Standardizes speed; direction sin/cos remain unscaled; scalers are persisted with the model.
     """
 
     def __init__(
         self,
         cfg: OmegaConf | None = None,
-        history_steps: int = 72,
-        horizon_steps: int = 72,
+        history_steps: int = 24,
+        horizon_steps: int = 12,
         station_embedding_dim: int = 8,
         hidden_size: int = 128,
         num_layers: int = 2,
@@ -174,10 +179,11 @@ class BiLSTMModel(ModelInterface):
         # Will be initialized during training/loading
         self._model: _BiLSTMHead | None = None
         self._feature_columns: List[str] | None = None
-        self._target_columns: List[str] = ["u", "v"]
+        self._target_columns: List[str] = ["speed", "dir_sin", "dir_cos"]
         self._feature_scaler: StandardScaler | None = None
         self._target_scaler: StandardScaler | None = None
         self._station_id_to_index: Dict[str, int] | None = None
+        self._output_dim_per_step: int = 3
 
     # ------------- Public API -------------
     def train(self, dataset: pd.DataFrame) -> None:
@@ -211,6 +217,7 @@ class BiLSTMModel(ModelInterface):
             horizon_steps=self.horizon_steps,
             station_count=num_stations,
             station_embedding_dim=self.station_embedding_dim,
+            output_dim_per_step=self._output_dim_per_step,
         ).to(self.device)
 
         # Log model parameter count
@@ -348,7 +355,7 @@ class BiLSTMModel(ModelInterface):
 
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         results: List[pd.DataFrame] = []
-        freq = pd.Timedelta(minutes=10)
+        freq = pd.Timedelta(hours=1)
 
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
@@ -375,23 +382,30 @@ class BiLSTMModel(ModelInterface):
 
             self._model.eval()
             with torch.no_grad():
-                y_scaled = self._model(x, sid_idx).squeeze(0).cpu().numpy()
+                y_scaled = self._model(x, sid_idx).squeeze(0).cpu().numpy()  # [H, 3]
 
-            # Inverse scale targets
-            y_flat = y_scaled.reshape(-1, 2)
-            y_inv = self._target_scaler.inverse_transform(y_flat)
-            y_inv = y_inv.reshape(self.horizon_steps, 2)
+            # Inverse scale speed; normalize and decode direction from sin/cos
+            speed_scaled = y_scaled[:, 0:1]
+            dir_sin = y_scaled[:, 1]
+            dir_cos = y_scaled[:, 2]
+            speed_inv = self._target_scaler.inverse_transform(speed_scaled).reshape(-1)
+            norm = np.sqrt(dir_sin**2 + dir_cos**2) + 1e-8
+            dir_sin_n = dir_sin / norm
+            dir_cos_n = dir_cos / norm
 
             # Build timestamps for the forecast horizon
             last_ts = pd.to_datetime(hist.iloc[-1]["record_date"])
             future_index = [last_ts + freq * (i + 1) for i in range(self.horizon_steps)]
 
+            # decode coming-from direction in degrees
+            direction_vals = np.degrees(np.arctan2(dir_sin_n, dir_cos_n)) % 360.0
+
             out_df = pd.DataFrame(
                 {
                     "station_id": station_id,
                     "record_date": future_index,
-                    "u_pred": y_inv[:, 0],
-                    "v_pred": y_inv[:, 1],
+                    "average_wind_speed_pred": speed_inv,
+                    "average_wind_direction_pred": direction_vals,
                 }
             )
             results.append(out_df)
@@ -438,91 +452,78 @@ class BiLSTMModel(ModelInterface):
         self._model.eval()
         non_block = self.device == "cuda" and torch.cuda.is_available()
 
-        preds_u: List[np.ndarray] = []
-        preds_v: List[np.ndarray] = []
-        trues_u: List[np.ndarray] = []
-        trues_v: List[np.ndarray] = []
+        preds_speed: List[np.ndarray] = []
+        trues_speed: List[np.ndarray] = []
+        preds_dir_deg: List[np.ndarray] = []
+        trues_dir_deg: List[np.ndarray] = []
 
         with torch.no_grad():
             for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
                 xb = xb.to(self.device, non_blocking=non_block)
                 sb = sb.to(self.device, non_blocking=non_block)
 
-                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 2]
-                y_true_scaled = yb.cpu().numpy()  # [B, H, 2]
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 3]
 
-                # Inverse scale
                 B, H, _ = y_pred_scaled.shape
-                y_pred_flat = y_pred_scaled.reshape(-1, 2)
-                y_true_flat = y_true_scaled.reshape(-1, 2)
-                y_pred = self._target_scaler.inverse_transform(y_pred_flat).reshape(
-                    B, H, 2
+                # Inverse speed scaling
+                speed_pred = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                speed_true = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+
+                # Decode directions
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                pred_dir = (
+                    np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm))
+                    % 360.0
                 )
-                y_true = self._target_scaler.inverse_transform(y_true_flat).reshape(
-                    B, H, 2
+                true_dir = (
+                    np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm))
+                    % 360.0
                 )
 
-                preds_u.append(y_pred[:, :, 0].reshape(-1))
-                preds_v.append(y_pred[:, :, 1].reshape(-1))
-                trues_u.append(y_true[:, :, 0].reshape(-1))
-                trues_v.append(y_true[:, :, 1].reshape(-1))
+                preds_speed.append(speed_pred.reshape(-1))
+                trues_speed.append(speed_true.reshape(-1))
+                preds_dir_deg.append(pred_dir.reshape(-1))
+                trues_dir_deg.append(true_dir.reshape(-1))
 
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
-        u_pred = np.concatenate(preds_u)
-        v_pred = np.concatenate(preds_v)
-        u_true = np.concatenate(trues_u)
-        v_true = np.concatenate(trues_v)
+        speed_pred_all = np.concatenate(preds_speed)
+        speed_true_all = np.concatenate(trues_speed)
+        dir_pred_all = np.concatenate(preds_dir_deg)
+        dir_true_all = np.concatenate(trues_dir_deg)
 
-        # Basic metrics for u, v
-        mae_u = float(np.mean(np.abs(u_pred - u_true)))
-        rmse_u = float(np.sqrt(np.mean((u_pred - u_true) ** 2)))
-        mae_v = float(np.mean(np.abs(v_pred - v_true)))
-        rmse_v = float(np.sqrt(np.mean((v_pred - v_true) ** 2)))
-
-        # Derived speed metrics
-        speed_pred = np.sqrt(u_pred**2 + v_pred**2)
-        speed_true = np.sqrt(u_true**2 + v_true**2)
-        mae_speed = float(np.mean(np.abs(speed_pred - speed_true)))
-        rmse_speed = float(np.sqrt(np.mean((speed_pred - speed_true) ** 2)))
-
-        # Direction error (meteorological coming-from): dir = atan2(-u, -v) in degrees [0, 360)
-        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
-            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
-            ang = np.mod(ang, 360.0)
-            return ang
+        mae_speed = float(np.mean(np.abs(speed_pred_all - speed_true_all)))
+        rmse_speed = float(np.sqrt(np.mean((speed_pred_all - speed_true_all) ** 2)))
 
         def angular_mae_deg(a_deg: np.ndarray, b_deg: np.ndarray) -> float:
-            # Minimal absolute angular difference on the circle
             diff = np.abs(((a_deg - b_deg + 180.0) % 360.0) - 180.0)
             return float(np.mean(diff))
 
-        dir_pred = uv_to_dir_deg(u_pred, v_pred)
-        dir_true = uv_to_dir_deg(u_true, v_true)
-        mae_dir_deg = angular_mae_deg(dir_pred, dir_true)
+        mae_direction_deg = angular_mae_deg(dir_pred_all, dir_true_all)
 
         metrics = {
-            "mae_u": mae_u,
-            "rmse_u": rmse_u,
-            "mae_v": mae_v,
-            "rmse_v": rmse_v,
             "mae_speed": mae_speed,
             "rmse_speed": rmse_speed,
-            "mae_direction_deg": mae_dir_deg,
+            "mae_direction_deg": mae_direction_deg,
         }
-
         logger.info(
             "Evaluation metrics: "
             + ", ".join(
                 [
-                    f"mae_u={mae_u:.4f}",
-                    f"rmse_u={rmse_u:.4f}",
-                    f"mae_v={mae_v:.4f}",
-                    f"rmse_v={rmse_v:.4f}",
                     f"mae_speed={mae_speed:.4f}",
                     f"rmse_speed={rmse_speed:.4f}",
-                    f"mae_direction_deg={mae_dir_deg:.2f}°",
+                    f"mae_direction_deg={mae_direction_deg:.2f}°",
                 ]
             )
         )
@@ -562,10 +563,6 @@ class BiLSTMModel(ModelInterface):
         )
 
         H = self.horizon_steps
-        sum_abs_u = np.zeros(H, dtype=float)
-        sum_sq_u = np.zeros(H, dtype=float)
-        sum_abs_v = np.zeros(H, dtype=float)
-        sum_sq_v = np.zeros(H, dtype=float)
         sum_abs_speed = np.zeros(H, dtype=float)
         sum_sq_speed = np.zeros(H, dtype=float)
         sum_abs_dir = np.zeros(H, dtype=float)
@@ -574,55 +571,46 @@ class BiLSTMModel(ModelInterface):
         self._model.eval()
         non_block = self.device == "cuda" and torch.cuda.is_available()
 
-        def uv_to_dir_deg(u_arr: np.ndarray, v_arr: np.ndarray) -> np.ndarray:
-            ang = np.degrees(np.arctan2(-u_arr, -v_arr))
-            return np.mod(ang, 360.0)
+        def angular_error_deg(pred_deg: np.ndarray, true_deg: np.ndarray) -> np.ndarray:
+            return np.abs(((pred_deg - true_deg + 180.0) % 360.0) - 180.0)
 
         with torch.no_grad():
             for batch_idx, (xb, yb, sb) in enumerate(eval_loader, start=1):
                 xb = xb.to(self.device, non_blocking=non_block)
                 sb = sb.to(self.device, non_blocking=non_block)
 
-                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 2]
-                y_true_scaled = yb.cpu().numpy()  # [B, H, 2]
+                y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 3]
 
                 B, H_, _ = y_pred_scaled.shape
                 assert H_ == H
 
-                # Inverse scale
-                y_pred = self._target_scaler.inverse_transform(
-                    y_pred_scaled.reshape(-1, 2)
-                ).reshape(B, H, 2)
-                y_true = self._target_scaler.inverse_transform(
-                    y_true_scaled.reshape(-1, 2)
-                ).reshape(B, H, 2)
+                sp_p = self._target_scaler.inverse_transform(
+                    y_pred_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
+                sp_t = self._target_scaler.inverse_transform(
+                    y_true_scaled[:, :, 0:1].reshape(-1, 1)
+                ).reshape(B, H)
 
-                u_p = y_pred[:, :, 0]
-                v_p = y_pred[:, :, 1]
-                u_t = y_true[:, :, 0]
-                v_t = y_true[:, :, 1]
-
-                # u, v errors
-                abs_u = np.abs(u_p - u_t).sum(axis=0)
-                sq_u = ((u_p - u_t) ** 2).sum(axis=0)
-                abs_v = np.abs(v_p - v_t).sum(axis=0)
-                sq_v = ((v_p - v_t) ** 2).sum(axis=0)
-
-                # speed errors
-                sp_p = np.sqrt(u_p**2 + v_p**2)
-                sp_t = np.sqrt(u_t**2 + v_t**2)
                 abs_sp = np.abs(sp_p - sp_t).sum(axis=0)
                 sq_sp = ((sp_p - sp_t) ** 2).sum(axis=0)
 
-                # direction absolute error (degrees) with circular difference
-                dir_p = uv_to_dir_deg(u_p, v_p)
-                dir_t = uv_to_dir_deg(u_t, v_t)
-                diff_dir = np.abs(((dir_p - dir_t + 180.0) % 360.0) - 180.0).sum(axis=0)
+                pred_sin = y_pred_scaled[:, :, 1]
+                pred_cos = y_pred_scaled[:, :, 2]
+                true_sin = y_true_scaled[:, :, 1]
+                true_cos = y_true_scaled[:, :, 2]
+                pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
+                true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
+                dir_p = (
+                    np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm))
+                    % 360.0
+                )
+                dir_t = (
+                    np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm))
+                    % 360.0
+                )
+                diff_dir = angular_error_deg(dir_p, dir_t).sum(axis=0)
 
-                sum_abs_u += abs_u
-                sum_sq_u += sq_u
-                sum_abs_v += abs_v
-                sum_sq_v += sq_v
                 sum_abs_speed += abs_sp
                 sum_sq_speed += sq_sp
                 sum_abs_dir += diff_dir
@@ -631,22 +619,13 @@ class BiLSTMModel(ModelInterface):
                 if max_batches is not None and batch_idx >= max_batches:
                     break
 
-        # Avoid division by zero
         count = np.maximum(count, 1.0)
 
-        mae_u = (sum_abs_u / count).tolist()
-        rmse_u = np.sqrt(sum_sq_u / count).tolist()
-        mae_v = (sum_abs_v / count).tolist()
-        rmse_v = np.sqrt(sum_sq_v / count).tolist()
         mae_speed = (sum_abs_speed / count).tolist()
         rmse_speed = np.sqrt(sum_sq_speed / count).tolist()
         mae_direction_deg = (sum_abs_dir / count).tolist()
 
         metrics: Dict[str, List[float]] = {
-            "mae_u": mae_u,
-            "rmse_u": rmse_u,
-            "mae_v": mae_v,
-            "rmse_v": rmse_v,
             "mae_speed": mae_speed,
             "rmse_speed": rmse_speed,
             "mae_direction_deg": mae_direction_deg,
@@ -663,29 +642,23 @@ class BiLSTMModel(ModelInterface):
                 plt = importlib.import_module("matplotlib.pyplot")
                 horizons = np.arange(1, H + 1)
 
-                # Plot u, v, speed MAE/RMSE
+                # Plot speed MAE/RMSE
                 fig1 = plt.figure(figsize=(10, 6))
-                plt.plot(horizons, mae_u, label="MAE u")
-                plt.plot(horizons, rmse_u, label="RMSE u")
-                plt.plot(horizons, mae_v, label="MAE v")
-                plt.plot(horizons, rmse_v, label="RMSE v")
                 plt.plot(horizons, mae_speed, label="MAE speed")
                 plt.plot(horizons, rmse_speed, label="RMSE speed")
-                plt.xlabel("Horizon (steps, 10-min)")
+                plt.xlabel("Horizon (hours)")
                 plt.ylabel("Error")
-                plt.title("Per-horizon errors: u, v, speed")
+                plt.title("Per-horizon errors: speed")
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 fig1.tight_layout()
-                fig1.savefig(
-                    os.path.join(save_dir, "per_horizon_uv_speed.png"), dpi=150
-                )
+                fig1.savefig(os.path.join(save_dir, "per_horizon_speed.png"), dpi=150)
                 plt.close(fig1)
 
                 # Plot direction MAE
                 fig2 = plt.figure(figsize=(10, 4))
                 plt.plot(horizons, mae_direction_deg, label="MAE direction (deg)")
-                plt.xlabel("Horizon (steps, 10-min)")
+                plt.xlabel("Horizon (hours)")
                 plt.ylabel("Degrees")
                 plt.title("Per-horizon direction error")
                 plt.grid(True, alpha=0.3)
@@ -761,6 +734,10 @@ class BiLSTMModel(ModelInterface):
         self._station_id_to_index = dict(metadata["station_id_to_index"])  # type: ignore[arg-type]
         self._feature_scaler = metadata["feature_scaler"]
         self._target_scaler = metadata["target_scaler"]
+        # Backward compatibility: set output dim
+        self._output_dim_per_step = (
+            3 if self._target_columns == ["speed", "dir_sin", "dir_cos"] else 2
+        )
 
         feature_dim = len(self._feature_columns)
         station_count = (
@@ -774,6 +751,7 @@ class BiLSTMModel(ModelInterface):
             horizon_steps=self.horizon_steps,
             station_count=station_count,
             station_embedding_dim=self.station_embedding_dim,
+            output_dim_per_step=self._output_dim_per_step,
         ).to(self.device)
         # Load model with proper device mapping - handle GPU->CPU/MPS conversion
         state_dict = torch.load(model_path, map_location=self.device)
@@ -786,24 +764,16 @@ class BiLSTMModel(ModelInterface):
     ) -> pd.DataFrame:
         """
         - Enforce dtypes and sort order.
-        - Drop `quality_level` if present.
-        - Create targets u, v from average_wind_speed/direction.
-        - Handle -999 -> NaN and impute within station.
-        - Fit/apply scalers on features and targets.
+        - Create derived columns for speed, sin/cos direction, and cyclical time features.
+        - Handle -999 -> NaN sentinel.
+        - Resample to regular hourly grid per station with forward/backward fill.
+        - Fit/apply scalers (speed only; direction sin/cos and time features unscaled).
         """
         required_cols = [
             "station_id",
             "record_date",
             "average_wind_speed",
             "average_wind_direction",
-            "air_pressure",
-            "air_temperature_2m",
-            "air_temperature_5cm",
-            "relative_humidity",
-            "dew_point_temperature",
-            "precipitation_duration",
-            "sum_precipitation_height",
-            "precipitation_indicator",
         ]
 
         missing = [c for c in required_cols if c not in dataset.columns]
@@ -811,79 +781,178 @@ class BiLSTMModel(ModelInterface):
             raise ValueError(f"Dataset missing required columns: {missing}")
 
         df = dataset.copy()
-        if "quality_level" in df.columns:
-            df = df.drop(columns=["quality_level"])
-
         if not pd.api.types.is_datetime64_any_dtype(df["record_date"]):
             df["record_date"] = pd.to_datetime(
                 df["record_date"], errors="coerce", utc=False
             )
 
-        # Create targets u, v (meteorological convention: coming-from)
-        # u = -speed * sin(dir), v = -speed * cos(dir)
+        # Replace sentinel -999 with NaN in wind columns
+        df["average_wind_speed"] = df["average_wind_speed"].replace(-999, np.nan)
+        df["average_wind_direction"] = df["average_wind_direction"].replace(
+            -999, np.nan
+        )
+
+        # Create derived columns for modeling
+        # Convert direction to radians and create sin/cos encodings
         direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
         speed = df["average_wind_speed"].astype(float)
-        df["u"] = -speed * np.sin(direction_rad)
-        df["v"] = -speed * np.cos(direction_rad)
 
-        # Replace -999 with NaN in numeric columns
-        numeric_cols = list(df.select_dtypes(include=["number"]).columns)
-        if "station_id" in numeric_cols:
-            numeric_cols.remove("station_id")
-        for col in numeric_cols:
-            df[col] = df[col].replace(-999, np.nan)
+        # Features and targets: speed (scaled) and direction as sin/cos (unscaled)
+        df["speed"] = speed
+        df["dir_sin"] = np.sin(direction_rad)
+        df["dir_cos"] = np.cos(direction_rad)
 
-        # Sort by station and time
+        # Add cyclical time features
+        # Hour of day (0-23) encoded as sin/cos
+        df["hour"] = df["record_date"].dt.hour
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+
+        # Day of week (0-6) encoded as sin/cos
+        df["day_of_week"] = df["record_date"].dt.dayofweek
+        df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+        df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+
+        # Month (1-12) encoded as sin/cos
+        df["month"] = df["record_date"].dt.month
+        df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12)
+        df["month_cos"] = np.cos(2 * np.pi * (df["month"] - 1) / 12)
+
+        # Day of year (1-365/366) encoded as sin/cos for seasonality
+        df["day_of_year"] = df["record_date"].dt.dayofyear
+        df["day_of_year_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
+        df["day_of_year_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
+
+        # Resample to regular hourly grid per station and forward/back-fill
+        freq = "1h"
+
+        def resample_group(g: pd.DataFrame) -> pd.DataFrame:
+            g = g.sort_values("record_date").set_index("record_date")
+            g = g.asfreq(freq)
+            # Fill wind-derived features
+            wind_cols = [
+                "average_wind_speed",
+                "average_wind_direction",
+                "speed",
+                "dir_sin",
+                "dir_cos",
+            ]
+            g[wind_cols] = g[wind_cols].ffill().bfill()
+            # Keep station_id
+            g["station_id"] = g["station_id"].ffill().bfill()
+            # Regenerate time features after resampling (they may have gaps)
+            g = g.reset_index()
+            g["hour"] = g["record_date"].dt.hour
+            g["hour_sin"] = np.sin(2 * np.pi * g["hour"] / 24)
+            g["hour_cos"] = np.cos(2 * np.pi * g["hour"] / 24)
+            g["day_of_week"] = g["record_date"].dt.dayofweek
+            g["day_of_week_sin"] = np.sin(2 * np.pi * g["day_of_week"] / 7)
+            g["day_of_week_cos"] = np.cos(2 * np.pi * g["day_of_week"] / 7)
+            g["month"] = g["record_date"].dt.month
+            g["month_sin"] = np.sin(2 * np.pi * (g["month"] - 1) / 12)
+            g["month_cos"] = np.cos(2 * np.pi * (g["month"] - 1) / 12)
+            g["day_of_year"] = g["record_date"].dt.dayofyear
+            g["day_of_year_sin"] = np.sin(2 * np.pi * g["day_of_year"] / 365.25)
+            g["day_of_year_cos"] = np.cos(2 * np.pi * g["day_of_year"] / 365.25)
+            return g
+
+        df = (
+            df.groupby("station_id", group_keys=False, sort=False)
+            .apply(resample_group)
+            .reset_index(drop=True)
+        )
+
+        # After resampling and fills, apply global mean fill for any residual NaNs in wind data
+        wind_and_target_cols = [
+            "average_wind_speed",
+            "average_wind_direction",
+            "speed",
+            "dir_sin",
+            "dir_cos",
+        ]
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(
+            df[wind_and_target_cols].mean(numeric_only=True)
+        )
+
+        # Drop rows with missing targets as a last resort
+        df = df.dropna(subset=["speed", "dir_sin", "dir_cos"])
+
+        # Replace any remaining inf/-inf with NaN then fill with zeros
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(0.0)
+
+        # Ensure ordering
         df = df.sort_values(["station_id", "record_date"]).reset_index(drop=True)
 
-        # Impute missing values within each station by forward/backward fill, then global fill
-        # Use column selection in groupby to avoid FutureWarning and ensure grouping col is excluded
-        df[numeric_cols] = (
-            df.groupby("station_id", sort=False)[numeric_cols]
-            .apply(lambda g: g.ffill().bfill())
-            .reset_index(level=0, drop=True)
-        )
-        df[numeric_cols] = df[numeric_cols].fillna(
-            df[numeric_cols].mean(numeric_only=True)
-        )
-
-        # Select features (exclude identifiers and raw direction/speed; keep derived u,v in targets only)
+        # Select features: wind speed, direction (sin/cos) and cyclical time features
         feature_cols = [
-            "air_pressure",
-            "air_temperature_2m",
-            "air_temperature_5cm",
-            "relative_humidity",
-            "dew_point_temperature",
-            "precipitation_duration",
-            "sum_precipitation_height",
-            "precipitation_indicator",
-            "u",
-            "v",
+            "speed",
+            "dir_sin",
+            "dir_cos",
+            "hour_sin",
+            "hour_cos",
+            "day_of_week_sin",
+            "day_of_week_cos",
+            "month_sin",
+            "month_cos",
+            "day_of_year_sin",
+            "day_of_year_cos",
         ]
         self._feature_columns = (
             feature_cols if self._feature_columns is None else self._feature_columns
         )
 
-        # Station mapping (string-ify to be robust)
+        # Station mapping
         if fit_scalers or self._station_id_to_index is None:
-            station_ids = [str(s) for s in pd.unique(df["station_id"])]
+            station_ids = [str(s) for s in pd.unique(df["station_id"]) if pd.notna(s)]
             self._station_id_to_index = {sid: i for i, sid in enumerate(station_ids)}
 
-        # Fit or apply scalers
+        # Fit/apply scalers
         if fit_scalers or self._feature_scaler is None or self._target_scaler is None:
             self._feature_scaler = StandardScaler()
             self._target_scaler = StandardScaler()
-            # Fit on available rows
-            self._feature_scaler.fit(df[self._feature_columns].to_numpy(dtype=float))
-            self._target_scaler.fit(df[["u", "v"]].to_numpy(dtype=float))
+            # Scale only speed; direction sin/cos and time features are already in bounded ranges
+            self._feature_scaler.fit(df[["speed"]].to_numpy(dtype=float))
+            # Target scaler is same as feature scaler for speed (they share the same scaler)
+            self._target_scaler = self._feature_scaler
+            # Guard against zero-variance leading to div-by-zero
+            if hasattr(self._feature_scaler, "scale_"):
+                with np.errstate(invalid="ignore"):
+                    self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = (
+                        1.0
+                    )
 
-        # Apply scalers (store scaled copies; keep original df for timestamps and ids)
-        df[self._feature_columns] = self._feature_scaler.transform(
-            df[self._feature_columns].to_numpy(dtype=float)
+        # Scale speed in features (same scaler for input and output speed)
+        df[["speed"]] = self._feature_scaler.transform(
+            df[["speed"]].to_numpy(dtype=float)
         )
-        df[["u", "v"]] = self._target_scaler.transform(
-            df[["u", "v"]].to_numpy(dtype=float)
+
+        # Safety: ensure no NaNs/Infs after scaling
+        df[self._feature_columns] = np.nan_to_num(
+            df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0
         )
+        df[["speed", "dir_sin", "dir_cos"]] = np.nan_to_num(
+            df[["speed", "dir_sin", "dir_cos"]], nan=0.0, posinf=0.0, neginf=0.0
+        )
+        # Clip to a reasonable range to avoid exploding activations
+        # Speed after scaling
+        df[["speed"]] = df[["speed"]].clip(lower=-10.0, upper=10.0)
+        # Direction features are already in [-1, 1]
+        df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(
+            lower=-1.0, upper=1.0
+        )
+        # Time features are already in [-1, 1] so clip them conservatively
+        time_features = [
+            "hour_sin",
+            "hour_cos",
+            "day_of_week_sin",
+            "day_of_week_cos",
+            "month_sin",
+            "month_cos",
+            "day_of_year_sin",
+            "day_of_year_cos",
+        ]
+        df[time_features] = df[time_features].clip(lower=-1.1, upper=1.1)
 
         return df
 
@@ -897,7 +966,7 @@ class BiLSTMModel(ModelInterface):
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
             features = g[self._feature_columns].to_numpy(dtype=float)
-            targets = g[["u", "v"]].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
             n = len(g)
             if n < hist + horiz:
                 continue
@@ -906,6 +975,9 @@ class BiLSTMModel(ModelInterface):
             for start in range(0, n - hist - horiz + 1):
                 x = features[start : start + hist]
                 y = targets[start + hist : start + hist + horiz]
+                # Skip sequences that contain non-finite values
+                if not (np.isfinite(x).all() and np.isfinite(y).all()):
+                    continue
                 sequences.append((x, y, sid_idx))
 
         station_count = (
@@ -937,7 +1009,7 @@ class BiLSTMModel(ModelInterface):
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
             features = g[self._feature_columns].to_numpy(dtype=float)
-            targets = g[["u", "v"]].to_numpy(dtype=float)
+            targets = g[["speed", "dir_sin", "dir_cos"]].to_numpy(dtype=float)
             n = len(g)
             if n < hist + horiz:
                 continue

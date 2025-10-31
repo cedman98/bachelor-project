@@ -124,8 +124,9 @@ class MeasurementService:
 
     def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
         """
-        The function loads for all stations the last 72 measurements.
-        @return: The measurements DataFrame.
+        The function loads for all stations the last 24 hours of 10-minute measurements,
+        then aggregates them to hourly resolution by taking the mean (same as aggregate_hourly.ipynb).
+        @return: The measurements DataFrame aggregated to hourly resolution.
         """
         logger.info(f"Loading all recent measurements from database")
         df = self.measurement_data_provider.load_all_recent_measurements_from_database()

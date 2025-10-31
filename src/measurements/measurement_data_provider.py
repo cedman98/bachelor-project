@@ -389,14 +389,16 @@ class MeasurementDataProvider:
 
     def load_all_recent_measurements_from_database(self) -> pd.DataFrame:
         """
-        Load the last 72 measurements per station using an efficient per-station LIMIT.
+        Load the last 24 hours of 10-minute measurements per station, then aggregate to hourly
+        by taking the mean (same approach as aggregate_hourly.ipynb).
         Uses a LATERAL join so the DB can leverage the (station_id, record_date DESC) index.
-        @return: The measurements DataFrame.
+        @return: The measurements DataFrame aggregated to hourly resolution.
         """
 
         additional_ids = list(self.cfg.dwd.additional_measurement_stations or [])
         exclude_ids = list(self.cfg.dwd.exclude_brandenburg_measurement_stations or [])
 
+        # First, fetch 10-minute data for the last 24 hours (144 measurements = 24 * 6)
         query = text(
             """
             WITH
@@ -410,7 +412,7 @@ class MeasurementDataProvider:
                 (m.max_record_date - (gs.step_idx || ' minutes')::interval) AS step_time
               FROM max_ts m
               CROSS JOIN LATERAL (
-                SELECT generate_series(0, 71) * 10 AS step_idx
+                SELECT generate_series(0, 143) * 10 AS step_idx
               ) gs
             ),
             stations AS (
@@ -480,7 +482,35 @@ class MeasurementDataProvider:
             bindparam("exclude_ids", expanding=True, value=exclude_ids),
         )
 
-        return self.load_measurements_from_database(query)
+        # Load 10-minute data
+        df_10min = self.load_measurements_from_database(query)
+
+        # Aggregate to hourly by taking the mean (same as aggregate_hourly.ipynb)
+        if df_10min.empty:
+            return df_10min
+
+        # Ensure record_date is datetime
+        df_10min["record_date"] = pd.to_datetime(df_10min["record_date"])
+
+        # Create hourly timestamp by flooring to the hour
+        df_10min["hour"] = df_10min["record_date"].dt.floor("h")
+
+        # Get all columns except timestamp and hour for aggregation
+        value_columns = [
+            col
+            for col in df_10min.columns
+            if col not in ["record_date", "hour", "station_id"]
+        ]
+
+        # Aggregate to hourly resolution by taking the mean
+        hourly_df = (
+            df_10min.groupby(["station_id", "hour"])[value_columns].mean().reset_index()
+        )
+
+        # Rename 'hour' back to 'record_date' for consistency
+        hourly_df = hourly_df.rename(columns={"hour": "record_date"})
+
+        return hourly_df
 
     def _get_download_urls(
         self, weather_station_id: int, only_now: bool = False, dataset: str = "wind"

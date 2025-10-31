@@ -36,7 +36,7 @@ class PredictionService:
         )
 
     def predict_measurements(self, upsert_to_database: bool = True) -> pd.DataFrame:
-        # 1. Load the last 72 measurements for each station
+        # 1. Load the last 24 hours of 10-minute measurements, aggregated to hourly for model input
         measurements_df = (
             self.measurement_service.load_all_recent_measurements_from_database()
         )
