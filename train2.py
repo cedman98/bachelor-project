@@ -23,7 +23,7 @@ def main():
     
     ms_service = MeasurementService(cfg, db, weather_stations)
     
-    measurements_df = pd.read_parquet("data/measurements.parquet")
+    measurements_df = pd.read_parquet("data/extended_hourly_measurements.parquet")
     measurements_df = measurements_df.sort_values(by="record_date")
     logger.info(f"Measurements: {len(measurements_df)} rows")
     
@@ -32,14 +32,13 @@ def main():
     test_df = measurements_df[measurements_df['record_date']>end_date].copy()
     
     # BiLSTM full training hyperparameters (RTX 4080 Super)
-    # Using last 12 hours (72 steps at 10-min intervals) to forecast next 12 hours (72 steps).
+    # Using last 24 hours (24 steps at 1-hour intervals) to forecast next 12 hours (12 steps).
     # BiLSTM processes the full sequence through bidirectional LSTM layers.
-    # Based on prototype results: model was overfitting (train loss 0.129, val loss 0.359)
-    # Adjustments: increased dropout, larger model for capacity, more patience
-    # Expected training time: ~10-15 hours for full run (based on ~5min/epoch × 100-150 epochs)
+    # Features: wind speed, direction (sin/cos), and cyclical time encodings only (no weather features).
+    # Expected training time: faster than 10-min model due to fewer timesteps per sequence
     model = BiLSTMModel(
-        history_steps=144,           
-        horizon_steps=72,            
+        history_steps=24,            # 24 hours of history at 1-hour resolution
+        horizon_steps=12,            # 12 hours forecast at 1-hour resolution
         hidden_size=128,             
         num_layers=2,                
         station_embedding_dim=16,    
@@ -50,13 +49,13 @@ def main():
         val_split=0.15,              
         early_stopping_patience=15,  
         early_stopping_min_delta=1e-4, 
-        restore_best_weights=True,  
+        restore_best_weights=True,   # Restore best weights for final model
         shuffle_train=True          
     )
 
     model.train(train_df)
 
-    save_dir = "models/bilstm_full"
+    save_dir = "models/bilstm_full_last"
     os.makedirs(save_dir, exist_ok=True)
     model.save(save_dir)
     logger.info(f"Saved BiLSTM full model to {save_dir}")

@@ -20,7 +20,7 @@ class _SequenceDataset(Dataset):
 
     Each sample consists of:
     - X: [history_steps, feature_dim]
-    - y: [horizon_steps, 2] where the two targets are [u, v]
+    - y: [horizon_steps, 3] where the three targets are [speed, dir_sin, dir_cos]
     - station_index: int index for an embedding lookup
     """
 
@@ -116,12 +116,15 @@ class BiLSTMModel(ModelInterface):
     """
     Bidirectional LSTM model for multi-station, multi-step forecasting of wind speed and direction.
 
-    - Input data: 10-minute resolution time series with columns defined by the user.
-    - Targets: next 12 hours (72 steps) of [speed, dir_sin, dir_cos] where
+    - Input data: hourly resolution time series with columns defined by the user.
+    - Uses last 24h (24 steps) of context to predict next 12h (12 steps) of speed and direction.
+    - Features: wind speed, direction (sin/cos), and cyclical time encodings (hour, day of week, month, day of year).
+    - No weather features - purely wind and temporal patterns.
+    - Targets: next 12 hours (12 steps) of [speed, dir_sin, dir_cos] where
       speed = average_wind_speed, dir_sin = sin(direction_rad), dir_cos = cos(direction_rad)
       using meteorological convention (coming-from direction).
     - Handles multiple stations via a learned station embedding.
-    - Resamples to regular 10-minute grid with forward/backward fill for missing values.
+    - Resamples to regular hourly grid with forward/backward fill for missing values.
     - Replaces numeric sentinel -999 with NaN and imputes within-station via forward/backward fill.
     - Standardizes speed; direction sin/cos remain unscaled; scalers are persisted with the model.
     """
@@ -129,8 +132,8 @@ class BiLSTMModel(ModelInterface):
     def __init__(
         self,
         cfg: OmegaConf | None = None,
-        history_steps: int = 72,
-        horizon_steps: int = 72,
+        history_steps: int = 24,
+        horizon_steps: int = 12,
         station_embedding_dim: int = 8,
         hidden_size: int = 128,
         num_layers: int = 2,
@@ -352,7 +355,7 @@ class BiLSTMModel(ModelInterface):
 
         df = self._prepare_dataframe(dataset, fit_scalers=False)
         results: List[pd.DataFrame] = []
-        freq = pd.Timedelta(minutes=10)
+        freq = pd.Timedelta(hours=1)
 
         for station_id, g in df.groupby("station_id", sort=False):
             g = g.sort_values("record_date")
@@ -631,7 +634,7 @@ class BiLSTMModel(ModelInterface):
                 fig1 = plt.figure(figsize=(10, 6))
                 plt.plot(horizons, mae_speed, label="MAE speed")
                 plt.plot(horizons, rmse_speed, label="RMSE speed")
-                plt.xlabel("Horizon (steps, 10-min)")
+                plt.xlabel("Horizon (hours)")
                 plt.ylabel("Error")
                 plt.title("Per-horizon errors: speed")
                 plt.grid(True, alpha=0.3)
@@ -645,7 +648,7 @@ class BiLSTMModel(ModelInterface):
                 # Plot direction MAE
                 fig2 = plt.figure(figsize=(10, 4))
                 plt.plot(horizons, mae_direction_deg, label="MAE direction (deg)")
-                plt.xlabel("Horizon (steps, 10-min)")
+                plt.xlabel("Horizon (hours)")
                 plt.ylabel("Degrees")
                 plt.title("Per-horizon direction error")
                 plt.grid(True, alpha=0.3)
@@ -749,24 +752,16 @@ class BiLSTMModel(ModelInterface):
     ) -> pd.DataFrame:
         """
         - Enforce dtypes and sort order.
-        - Create derived columns for speed, sin/cos direction, and u,v components.
+        - Create derived columns for speed, sin/cos direction, and cyclical time features.
         - Handle -999 -> NaN sentinel.
-        - Resample to regular 10-minute grid per station with forward/backward fill.
-        - Fit/apply scalers (speed only; direction sin/cos unscaled).
+        - Resample to regular hourly grid per station with forward/backward fill.
+        - Fit/apply scalers (speed only; direction sin/cos and time features unscaled).
         """
         required_cols = [
             "station_id",
             "record_date",
             "average_wind_speed",
             "average_wind_direction",
-            "air_pressure",
-            "air_temperature_2m",
-            "air_temperature_5cm",
-            "relative_humidity",
-            "dew_point_temperature",
-            "precipitation_duration",
-            "sum_precipitation_height",
-            "precipitation_indicator",
         ]
 
         missing = [c for c in required_cols if c not in dataset.columns]
@@ -777,35 +772,66 @@ class BiLSTMModel(ModelInterface):
         if not pd.api.types.is_datetime64_any_dtype(df["record_date"]):
             df["record_date"] = pd.to_datetime(df["record_date"], errors="coerce", utc=False)
 
-        # Replace sentinel -999 with NaN in numeric columns, excluding station_id
-        numeric_cols = list(df.select_dtypes(include=["number"]).columns)
-        if "station_id" in numeric_cols:
-            numeric_cols.remove("station_id")
-        for col in numeric_cols:
-            df[col] = df[col].replace(-999, np.nan)
+        # Replace sentinel -999 with NaN in wind columns
+        df["average_wind_speed"] = df["average_wind_speed"].replace(-999, np.nan)
+        df["average_wind_direction"] = df["average_wind_direction"].replace(-999, np.nan)
 
         # Create derived columns for modeling
-        # u, v from meteorological coming-from convention (used as inputs)
+        # Convert direction to radians and create sin/cos encodings
         direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
         speed = df["average_wind_speed"].astype(float)
-        df["u"] = -speed * np.sin(direction_rad)
-        df["v"] = -speed * np.cos(direction_rad)
-        # Targets: speed (same as average_wind_speed) and direction as sin/cos
+        
+        # Features and targets: speed (scaled) and direction as sin/cos (unscaled)
         df["speed"] = speed
         df["dir_sin"] = np.sin(direction_rad)
         df["dir_cos"] = np.cos(direction_rad)
 
-        # Resample to regular 10-minute grid per station and forward/back-fill
-        freq = "10min"
+        # Add cyclical time features
+        # Hour of day (0-23) encoded as sin/cos
+        df["hour"] = df["record_date"].dt.hour
+        df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
+        df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
+        
+        # Day of week (0-6) encoded as sin/cos
+        df["day_of_week"] = df["record_date"].dt.dayofweek
+        df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
+        df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
+        
+        # Month (1-12) encoded as sin/cos
+        df["month"] = df["record_date"].dt.month
+        df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12)
+        df["month_cos"] = np.cos(2 * np.pi * (df["month"] - 1) / 12)
+        
+        # Day of year (1-365/366) encoded as sin/cos for seasonality
+        df["day_of_year"] = df["record_date"].dt.dayofyear
+        df["day_of_year_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
+        df["day_of_year_cos"] = np.cos(2 * np.pi * df["day_of_year"] / 365.25)
+
+        # Resample to regular hourly grid per station and forward/back-fill
+        freq = "1h"
         def resample_group(g: pd.DataFrame) -> pd.DataFrame:
             g = g.sort_values("record_date").set_index("record_date")
             g = g.asfreq(freq)
-            g[numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]] = (
-                g[numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]].ffill().bfill()
-            )
+            # Fill wind-derived features
+            wind_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+            g[wind_cols] = g[wind_cols].ffill().bfill()
             # Keep station_id
             g["station_id"] = g["station_id"].ffill().bfill()
-            return g.reset_index()
+            # Regenerate time features after resampling (they may have gaps)
+            g = g.reset_index()
+            g["hour"] = g["record_date"].dt.hour
+            g["hour_sin"] = np.sin(2 * np.pi * g["hour"] / 24)
+            g["hour_cos"] = np.cos(2 * np.pi * g["hour"] / 24)
+            g["day_of_week"] = g["record_date"].dt.dayofweek
+            g["day_of_week_sin"] = np.sin(2 * np.pi * g["day_of_week"] / 7)
+            g["day_of_week_cos"] = np.cos(2 * np.pi * g["day_of_week"] / 7)
+            g["month"] = g["record_date"].dt.month
+            g["month_sin"] = np.sin(2 * np.pi * (g["month"] - 1) / 12)
+            g["month_cos"] = np.cos(2 * np.pi * (g["month"] - 1) / 12)
+            g["day_of_year"] = g["record_date"].dt.dayofyear
+            g["day_of_year_sin"] = np.sin(2 * np.pi * g["day_of_year"] / 365.25)
+            g["day_of_year_cos"] = np.cos(2 * np.pi * g["day_of_year"] / 365.25)
+            return g
 
         df = (
             df.groupby("station_id", group_keys=False, sort=False)
@@ -813,10 +839,10 @@ class BiLSTMModel(ModelInterface):
             .reset_index(drop=True)
         )
 
-        # After resampling and fills, apply global mean fill for any residual NaNs
-        target_and_numeric = numeric_cols + ["u", "v", "speed", "dir_sin", "dir_cos"]
-        df[target_and_numeric] = df[target_and_numeric].fillna(
-            df[target_and_numeric].mean(numeric_only=True)
+        # After resampling and fills, apply global mean fill for any residual NaNs in wind data
+        wind_and_target_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(
+            df[wind_and_target_cols].mean(numeric_only=True)
         )
 
         # Drop rows with missing targets as a last resort
@@ -824,23 +850,24 @@ class BiLSTMModel(ModelInterface):
 
         # Replace any remaining inf/-inf with NaN then fill with zeros
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df[target_and_numeric] = df[target_and_numeric].fillna(0.0)
+        df[wind_and_target_cols] = df[wind_and_target_cols].fillna(0.0)
 
         # Ensure ordering
         df = df.sort_values(["station_id", "record_date"]).reset_index(drop=True)
 
-        # Select features (include derived u,v as inputs as well)
+        # Select features: wind speed, direction (sin/cos) and cyclical time features
         feature_cols = [
-            "air_pressure",
-            "air_temperature_2m",
-            "air_temperature_5cm",
-            "relative_humidity",
-            "dew_point_temperature",
-            "precipitation_duration",
-            "sum_precipitation_height",
-            "precipitation_indicator",
-            "u",
-            "v",
+            "speed",
+            "dir_sin",
+            "dir_cos",
+            "hour_sin",
+            "hour_cos",
+            "day_of_week_sin",
+            "day_of_week_cos",
+            "month_sin",
+            "month_cos",
+            "day_of_year_sin",
+            "day_of_year_cos",
         ]
         self._feature_columns = feature_cols if self._feature_columns is None else self._feature_columns
 
@@ -853,21 +880,17 @@ class BiLSTMModel(ModelInterface):
         if fit_scalers or self._feature_scaler is None or self._target_scaler is None:
             self._feature_scaler = StandardScaler()
             self._target_scaler = StandardScaler()
-            self._feature_scaler.fit(df[self._feature_columns].to_numpy(dtype=float))
-            # Only scale speed; direction sin/cos remain unscaled
-            self._target_scaler.fit(df[["speed"]].to_numpy(dtype=float))
-            # Guard against zero-variance features/targets leading to div-by-zero
+            # Scale only speed; direction sin/cos and time features are already in bounded ranges
+            self._feature_scaler.fit(df[["speed"]].to_numpy(dtype=float))
+            # Target scaler is same as feature scaler for speed (they share the same scaler)
+            self._target_scaler = self._feature_scaler
+            # Guard against zero-variance leading to div-by-zero
             if hasattr(self._feature_scaler, "scale_"):
                 with np.errstate(invalid="ignore"):
                     self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = 1.0
-            if hasattr(self._target_scaler, "scale_"):
-                with np.errstate(invalid="ignore"):
-                    self._target_scaler.scale_[self._target_scaler.scale_ == 0.0] = 1.0
 
-        df[self._feature_columns] = self._feature_scaler.transform(
-            df[self._feature_columns].to_numpy(dtype=float)
-        )
-        df[["speed"]] = self._target_scaler.transform(df[["speed"]].to_numpy(dtype=float))
+        # Scale speed in features (same scaler for input and output speed)
+        df[["speed"]] = self._feature_scaler.transform(df[["speed"]].to_numpy(dtype=float))
 
         # Safety: ensure no NaNs/Infs after scaling
         df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
@@ -875,9 +898,14 @@ class BiLSTMModel(ModelInterface):
             df[["speed", "dir_sin", "dir_cos"]], nan=0.0, posinf=0.0, neginf=0.0
         )
         # Clip to a reasonable range to avoid exploding activations
-        df[self._feature_columns] = df[self._feature_columns].clip(lower=-10.0, upper=10.0)
+        # Speed after scaling
         df[["speed"]] = df[["speed"]].clip(lower=-10.0, upper=10.0)
+        # Direction features are already in [-1, 1]
         df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(lower=-1.0, upper=1.0)
+        # Time features are already in [-1, 1] so clip them conservatively
+        time_features = ["hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
+                         "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos"]
+        df[time_features] = df[time_features].clip(lower=-1.1, upper=1.1)
 
         return df
 
