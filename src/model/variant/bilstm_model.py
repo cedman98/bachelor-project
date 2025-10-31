@@ -398,7 +398,7 @@ class BiLSTMModel(ModelInterface):
             future_index = [last_ts + freq * (i + 1) for i in range(self.horizon_steps)]
 
             # decode coming-from direction in degrees
-            direction_vals = (np.degrees(np.arctan2(dir_sin_n, dir_cos_n)) % 360.0)
+            direction_vals = np.degrees(np.arctan2(dir_sin_n, dir_cos_n)) % 360.0
 
             out_df = pd.DataFrame(
                 {
@@ -463,7 +463,7 @@ class BiLSTMModel(ModelInterface):
                 sb = sb.to(self.device, non_blocking=non_block)
 
                 y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
-                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 3]
 
                 B, H, _ = y_pred_scaled.shape
                 # Inverse speed scaling
@@ -481,8 +481,14 @@ class BiLSTMModel(ModelInterface):
                 true_cos = y_true_scaled[:, :, 2]
                 pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
                 true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
-                pred_dir = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
-                true_dir = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+                pred_dir = (
+                    np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm))
+                    % 360.0
+                )
+                true_dir = (
+                    np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm))
+                    % 360.0
+                )
 
                 preds_speed.append(speed_pred.reshape(-1))
                 trues_speed.append(speed_true.reshape(-1))
@@ -574,7 +580,7 @@ class BiLSTMModel(ModelInterface):
                 sb = sb.to(self.device, non_blocking=non_block)
 
                 y_pred_scaled = self._model(xb, sb).cpu().numpy()  # [B, H, 3]
-                y_true_scaled = yb.cpu().numpy()                    # [B, H, 3]
+                y_true_scaled = yb.cpu().numpy()  # [B, H, 3]
 
                 B, H_, _ = y_pred_scaled.shape
                 assert H_ == H
@@ -595,8 +601,14 @@ class BiLSTMModel(ModelInterface):
                 true_cos = y_true_scaled[:, :, 2]
                 pred_norm = np.sqrt(pred_sin**2 + pred_cos**2) + 1e-8
                 true_norm = np.sqrt(true_sin**2 + true_cos**2) + 1e-8
-                dir_p = (np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm)) % 360.0)
-                dir_t = (np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm)) % 360.0)
+                dir_p = (
+                    np.degrees(np.arctan2(pred_sin / pred_norm, pred_cos / pred_norm))
+                    % 360.0
+                )
+                dir_t = (
+                    np.degrees(np.arctan2(true_sin / true_norm, true_cos / true_norm))
+                    % 360.0
+                )
                 diff_dir = angular_error_deg(dir_p, dir_t).sum(axis=0)
 
                 sum_abs_speed += abs_sp
@@ -640,9 +652,7 @@ class BiLSTMModel(ModelInterface):
                 plt.grid(True, alpha=0.3)
                 plt.legend()
                 fig1.tight_layout()
-                fig1.savefig(
-                    os.path.join(save_dir, "per_horizon_speed.png"), dpi=150
-                )
+                fig1.savefig(os.path.join(save_dir, "per_horizon_speed.png"), dpi=150)
                 plt.close(fig1)
 
                 # Plot direction MAE
@@ -725,7 +735,9 @@ class BiLSTMModel(ModelInterface):
         self._feature_scaler = metadata["feature_scaler"]
         self._target_scaler = metadata["target_scaler"]
         # Backward compatibility: set output dim
-        self._output_dim_per_step = 3 if self._target_columns == ["speed", "dir_sin", "dir_cos"] else 2
+        self._output_dim_per_step = (
+            3 if self._target_columns == ["speed", "dir_sin", "dir_cos"] else 2
+        )
 
         feature_dim = len(self._feature_columns)
         station_count = (
@@ -770,17 +782,21 @@ class BiLSTMModel(ModelInterface):
 
         df = dataset.copy()
         if not pd.api.types.is_datetime64_any_dtype(df["record_date"]):
-            df["record_date"] = pd.to_datetime(df["record_date"], errors="coerce", utc=False)
+            df["record_date"] = pd.to_datetime(
+                df["record_date"], errors="coerce", utc=False
+            )
 
         # Replace sentinel -999 with NaN in wind columns
         df["average_wind_speed"] = df["average_wind_speed"].replace(-999, np.nan)
-        df["average_wind_direction"] = df["average_wind_direction"].replace(-999, np.nan)
+        df["average_wind_direction"] = df["average_wind_direction"].replace(
+            -999, np.nan
+        )
 
         # Create derived columns for modeling
         # Convert direction to radians and create sin/cos encodings
         direction_rad = np.deg2rad(df["average_wind_direction"].astype(float) % 360)
         speed = df["average_wind_speed"].astype(float)
-        
+
         # Features and targets: speed (scaled) and direction as sin/cos (unscaled)
         df["speed"] = speed
         df["dir_sin"] = np.sin(direction_rad)
@@ -791,17 +807,17 @@ class BiLSTMModel(ModelInterface):
         df["hour"] = df["record_date"].dt.hour
         df["hour_sin"] = np.sin(2 * np.pi * df["hour"] / 24)
         df["hour_cos"] = np.cos(2 * np.pi * df["hour"] / 24)
-        
+
         # Day of week (0-6) encoded as sin/cos
         df["day_of_week"] = df["record_date"].dt.dayofweek
         df["day_of_week_sin"] = np.sin(2 * np.pi * df["day_of_week"] / 7)
         df["day_of_week_cos"] = np.cos(2 * np.pi * df["day_of_week"] / 7)
-        
+
         # Month (1-12) encoded as sin/cos
         df["month"] = df["record_date"].dt.month
         df["month_sin"] = np.sin(2 * np.pi * (df["month"] - 1) / 12)
         df["month_cos"] = np.cos(2 * np.pi * (df["month"] - 1) / 12)
-        
+
         # Day of year (1-365/366) encoded as sin/cos for seasonality
         df["day_of_year"] = df["record_date"].dt.dayofyear
         df["day_of_year_sin"] = np.sin(2 * np.pi * df["day_of_year"] / 365.25)
@@ -809,11 +825,18 @@ class BiLSTMModel(ModelInterface):
 
         # Resample to regular hourly grid per station and forward/back-fill
         freq = "1h"
+
         def resample_group(g: pd.DataFrame) -> pd.DataFrame:
             g = g.sort_values("record_date").set_index("record_date")
             g = g.asfreq(freq)
             # Fill wind-derived features
-            wind_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+            wind_cols = [
+                "average_wind_speed",
+                "average_wind_direction",
+                "speed",
+                "dir_sin",
+                "dir_cos",
+            ]
             g[wind_cols] = g[wind_cols].ffill().bfill()
             # Keep station_id
             g["station_id"] = g["station_id"].ffill().bfill()
@@ -840,7 +863,13 @@ class BiLSTMModel(ModelInterface):
         )
 
         # After resampling and fills, apply global mean fill for any residual NaNs in wind data
-        wind_and_target_cols = ["average_wind_speed", "average_wind_direction", "speed", "dir_sin", "dir_cos"]
+        wind_and_target_cols = [
+            "average_wind_speed",
+            "average_wind_direction",
+            "speed",
+            "dir_sin",
+            "dir_cos",
+        ]
         df[wind_and_target_cols] = df[wind_and_target_cols].fillna(
             df[wind_and_target_cols].mean(numeric_only=True)
         )
@@ -869,7 +898,9 @@ class BiLSTMModel(ModelInterface):
             "day_of_year_sin",
             "day_of_year_cos",
         ]
-        self._feature_columns = feature_cols if self._feature_columns is None else self._feature_columns
+        self._feature_columns = (
+            feature_cols if self._feature_columns is None else self._feature_columns
+        )
 
         # Station mapping
         if fit_scalers or self._station_id_to_index is None:
@@ -887,13 +918,19 @@ class BiLSTMModel(ModelInterface):
             # Guard against zero-variance leading to div-by-zero
             if hasattr(self._feature_scaler, "scale_"):
                 with np.errstate(invalid="ignore"):
-                    self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = 1.0
+                    self._feature_scaler.scale_[self._feature_scaler.scale_ == 0.0] = (
+                        1.0
+                    )
 
         # Scale speed in features (same scaler for input and output speed)
-        df[["speed"]] = self._feature_scaler.transform(df[["speed"]].to_numpy(dtype=float))
+        df[["speed"]] = self._feature_scaler.transform(
+            df[["speed"]].to_numpy(dtype=float)
+        )
 
         # Safety: ensure no NaNs/Infs after scaling
-        df[self._feature_columns] = np.nan_to_num(df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0)
+        df[self._feature_columns] = np.nan_to_num(
+            df[self._feature_columns], nan=0.0, posinf=0.0, neginf=0.0
+        )
         df[["speed", "dir_sin", "dir_cos"]] = np.nan_to_num(
             df[["speed", "dir_sin", "dir_cos"]], nan=0.0, posinf=0.0, neginf=0.0
         )
@@ -901,10 +938,20 @@ class BiLSTMModel(ModelInterface):
         # Speed after scaling
         df[["speed"]] = df[["speed"]].clip(lower=-10.0, upper=10.0)
         # Direction features are already in [-1, 1]
-        df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(lower=-1.0, upper=1.0)
+        df[["dir_sin", "dir_cos"]] = df[["dir_sin", "dir_cos"]].clip(
+            lower=-1.0, upper=1.0
+        )
         # Time features are already in [-1, 1] so clip them conservatively
-        time_features = ["hour_sin", "hour_cos", "day_of_week_sin", "day_of_week_cos",
-                         "month_sin", "month_cos", "day_of_year_sin", "day_of_year_cos"]
+        time_features = [
+            "hour_sin",
+            "hour_cos",
+            "day_of_week_sin",
+            "day_of_week_cos",
+            "month_sin",
+            "month_cos",
+            "day_of_year_sin",
+            "day_of_year_cos",
+        ]
         df[time_features] = df[time_features].clip(lower=-1.1, upper=1.1)
 
         return df

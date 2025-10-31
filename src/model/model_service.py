@@ -5,6 +5,7 @@ from src.model.model_dataset_data_provider import ModelDatasetDataProvider
 from src.database.database_service import DatabaseService
 from src.measurements.measurement_service import MeasurementService
 import pandas as pd
+import numpy as np
 
 
 class ModelService:
@@ -73,7 +74,47 @@ class ModelService:
         if self.model is None:
             raise ValueError("Model not attached. Call attach_model(model) first.")
         df = self.model.predict(dataset)
-        df = df.rename(columns={"u_pred": "u", "v_pred": "v"})
+
+        # Convert model output (speed, direction) to u/v components
+        # The model outputs average_wind_speed_pred and average_wind_direction_pred
+        if (
+            "average_wind_speed_pred" in df.columns
+            and "average_wind_direction_pred" in df.columns
+        ):
+            # Convert direction from degrees to radians
+            direction_rad = np.deg2rad(df["average_wind_direction_pred"])
+            # Calculate u and v components using meteorological convention
+            df["u"] = -df["average_wind_speed_pred"] * np.sin(direction_rad)
+            df["v"] = -df["average_wind_speed_pred"] * np.cos(direction_rad)
+
+            # Expand hourly predictions back to 10-minute intervals
+            # Each hourly prediction becomes 6 10-minute intervals with the same values
+            expanded_rows = []
+            for _, row in df.iterrows():
+                station_id = row["station_id"]
+                hourly_time = pd.to_datetime(row["record_date"])
+                u_val = row["u"]
+                v_val = row["v"]
+
+                # Create 6 10-minute intervals for this hour
+                for i in range(6):
+                    ten_min_time = hourly_time + pd.Timedelta(minutes=i * 10)
+                    expanded_rows.append(
+                        {
+                            "station_id": station_id,
+                            "record_date": ten_min_time,
+                            "u": u_val,
+                            "v": v_val,
+                        }
+                    )
+
+            df = pd.DataFrame(expanded_rows)
+        else:
+            raise ValueError(
+                f"Model output missing required columns. Expected 'average_wind_speed_pred' and "
+                f"'average_wind_direction_pred', got: {df.columns.tolist()}"
+            )
+
         return df
 
     def train_model(self, save_path: str | None = None) -> None:
